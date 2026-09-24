@@ -1,0 +1,27 @@
+{
+  "entities": [
+    "wintermute",
+    "jump-trading",
+    "cumberland",
+    "galaxy-digital",
+    "amber-group"
+  ],
+  "chains": ["ethereum", "arbitrum_one", "base", "optimism", "bsc", "polygon", "avalanche", "solana"],
+  "min_transfer_usd": 250000,
+  "history_days": 365,
+  "arkham_page_size": 5000,
+  "max_pages_per_entity": 200,
+  "horizons_minutes": [5, 15, 60, 240, 1440, 4320],
+  "pre_windows_minutes": [60, 1440],
+  "min_pattern_events_train": 20,
+  "min_pattern_events_test": 8,
+  "fee_bps": 5.0,
+  "slippage_bps": 8.0,
+  "train_frac": 0.60,
+  "valid_frac": 0.20,
+  "random_seed": 42,
+  "llm_primary": "grok-4.6",
+  "llm_auditor": "grok-4.5",
+  "llm_min_confidence": 0.70,
+  "database": "entity_alpha.duckdb"
+}
