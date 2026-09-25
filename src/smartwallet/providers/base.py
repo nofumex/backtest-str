@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import asyncio
 
 from ..contracts import contract
 from ..http import HubClient, HubResponse
@@ -21,10 +22,8 @@ class BaseProvider:
             allow_upstream_error=allow_upstream_error,
         )
         spec = contract(endpoint_key)
-        self.storage.archive_raw(
-            spec.provider,
-            endpoint_key,
-            {"path_params": path_params or {}, "query": query or {}, "body": body},
-            response.raw,
+        await asyncio.to_thread(
+            self.storage.archive_raw, spec.provider, endpoint_key,
+            {"path_params": path_params or {}, "query": query or {}, "body": body}, response.raw,
         )
         return response

@@ -27,6 +27,19 @@ async def bounded_gather(coros: list[Any], limit: int) -> list[Any]:
     return await asyncio.gather(*(run(c) for c in coros), return_exceptions=True)
 
 
+def _cap_per_entity(rows: list[dict[str, Any]], maximum: int | None) -> list[dict[str, Any]]:
+    if not maximum:
+        return rows
+    counts: dict[str, int] = {}
+    out = []
+    for row in rows:
+        entity = row["entity_id"]
+        if counts.get(entity, 0) < maximum:
+            out.append(row)
+            counts[entity] = counts.get(entity, 0) + 1
+    return out
+
+
 async def discover_all(rt: Runtime, entity_config: str = "config/entities.yaml") -> list[dict[str, Any]]:
     entities = load_entities(entity_config)
     results = await bounded_gather(
@@ -56,15 +69,7 @@ async def backfill_all(rt: Runtime, *, from_date: str, max_wallets: int | None =
     for row in rows:
         unique[(row["entity_id"], row["address"])] = row
     items = list(unique.values())
-    if max_wallets:
-        per_entity: dict[str, int] = {}
-        capped = []
-        for item in items:
-            n = per_entity.get(item["entity_id"], 0)
-            if n < max_wallets:
-                capped.append(item)
-                per_entity[item["entity_id"]] = n + 1
-        items = capped
+    items = _cap_per_entity(items, max_wallets)
     coros = []
     labels = []
     for row in items:
@@ -88,8 +93,7 @@ async def backfill_all(rt: Runtime, *, from_date: str, max_wallets: int | None =
 
 async def snapshot_wallet_contexts(rt: Runtime, *, max_wallets: int | None = None, max_tokens: int = 5) -> list[dict[str, Any]]:
     rows = rt.storage.fetchall("SELECT DISTINCT entity_id,address FROM wallets WHERE address LIKE '0x%' ORDER BY entity_id,address")
-    if max_wallets:
-        rows = rows[:max_wallets]
+    rows = _cap_per_entity(rows, max_wallets)
     coros = [
         snapshot_evm_wallet_context(rt.arkham, rt.oklink, rt.gecko, rt.storage, entity_id=r["entity_id"], address=r["address"], max_tokens=max_tokens)
         for r in rows
@@ -114,8 +118,7 @@ async def stargate_context(rt: Runtime, *, from_date: str, to_date: str | None =
     start = parse_date(from_date)
     end = parse_date(to_date) if to_date else int(datetime.now(timezone.utc).timestamp())
     rows = rt.storage.fetchall("SELECT DISTINCT entity_id,address FROM wallets WHERE address LIKE '0x%' ORDER BY entity_id,address")
-    if max_wallets:
-        rows = rows[:max_wallets]
+    rows = _cap_per_entity(rows, max_wallets)
     coros = [snapshot_stargate_wallet(rt.bridges, rt.storage, entity_id=r["entity_id"], address=r["address"], start_ts=start, end_ts=end) for r in rows]
     await bounded_gather(coros, rt.settings.concurrency)
     return len(coros)
@@ -138,7 +141,7 @@ async def classify_all(rt: Runtime, entity_config: str = "config/entities.yaml",
 
 
 async def label_all_markets(rt: Runtime, *, max_episodes: int | None = None) -> int:
-    rows = rt.storage.fetchall("SELECT * FROM episodes WHERE primary_asset_key IS NOT NULL ORDER BY start_ts")
+    rows = rt.storage.fetchall("SELECT * FROM episodes WHERE COALESCE(target_asset_key, primary_asset_key) IS NOT NULL ORDER BY start_ts")
     if max_episodes:
         rows = rows[:max_episodes]
     labeler = MarketLabeler(rt.llama, rt.storage)
@@ -170,6 +173,8 @@ async def run_all(
         dashboard.update(name, stage_number)
         print(f"[run-all] START {name}", flush=True)
         value = await awaitable
+        completed = len(value) if isinstance(value, (list, dict)) else int(value or 0) if isinstance(value, int) else 1
+        dashboard.update(name, stage_number, completed, max(completed, 1), api_metrics=rt.hub.metrics)
         elapsed = time.monotonic() - stage_started
         print(f"[run-all] DONE  {name} ({elapsed:.1f}s, total {time.monotonic() - started:.1f}s)", flush=True)
         return value
@@ -184,10 +189,7 @@ async def run_all(
       result["classification"] = await stage("classification", classify_all(rt, entity_config))
       result["market_labels"] = await stage("market_labels", label_all_markets(rt, max_episodes=max_market_episodes))
       await stage("live_derivatives", snapshot_live_derivatives(rt.okx, rt.storage))
-    print("[run-all] START backtest", flush=True)
-    run_id, frame = run_backtest(rt.storage, min_n=min_backtest_n)
-    print("[run-all] DONE  backtest", flush=True)
-    result["backtest_run_id"] = run_id
-    result["reports"] = write_report(rt.storage, run_id, frame)
-    print("[run-all] DONE  reports", flush=True)
+      run_id, frame = await stage("backtest", asyncio.to_thread(run_backtest, rt.storage, min_n=min_backtest_n))
+      result["backtest_run_id"] = run_id
+      result["reports"] = await stage("reports", asyncio.to_thread(write_report, rt.storage, run_id, frame))
     return result

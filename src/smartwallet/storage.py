@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS wallet_events (
     usd_value REAL,
     primary_token_id TEXT,
     primary_asset_key TEXT,
+    target_asset_key TEXT,
     evidence_json TEXT NOT NULL,
     raw_json TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -231,6 +232,10 @@ class Storage:
         self._local = threading.local()
         with self.conn() as db:
             db.executescript(SCHEMA)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(episodes)")}
+            if "target_asset_key" not in columns:
+                db.execute("ALTER TABLE episodes ADD COLUMN target_asset_key TEXT")
+                db.execute("UPDATE episodes SET target_asset_key=primary_asset_key WHERE target_asset_key IS NULL")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.settings.db_path, timeout=30)
@@ -325,6 +330,12 @@ class Storage:
                 (entity_id, address, chain, source, utc_now_iso(), canonical_json(payload)),
             )
 
+    def position_exists(self, entity_id: str, address: str, chain: str, source: str) -> bool:
+        return self.fetchone("SELECT 1 FROM wallet_positions WHERE entity_id=? AND address=? AND chain=? AND source=? LIMIT 1", (entity_id, address, chain, source)) is not None
+
+    def enrichment_exists(self, tx_hash: str, chain: str, source: str) -> bool:
+        return self.fetchone("SELECT 1 FROM tx_enrichment WHERE tx_hash=? AND chain=? AND source=? LIMIT 1", (tx_hash, chain, source)) is not None
+
     def save_event(self, event: dict[str, Any]) -> None:
         with self.conn() as db:
             db.execute(
@@ -386,12 +397,12 @@ class Storage:
     def save_episode(self, episode: dict[str, Any]) -> None:
         with self.conn() as db:
             db.execute(
-                """INSERT OR REPLACE INTO episodes(episode_id,entity_id,start_ts,end_ts,wallets_json,event_ids_json,motif,primary_asset_key,gross_usd,evidence_json,
-                   intent_label,intent_json,intent_confidence,classified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT OR REPLACE INTO episodes(episode_id,entity_id,start_ts,end_ts,wallets_json,event_ids_json,motif,primary_asset_key,target_asset_key,gross_usd,evidence_json,
+                   intent_label,intent_json,intent_confidence,classified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     episode["episode_id"], episode["entity_id"], episode["start_ts"], episode["end_ts"],
                     canonical_json(episode["wallets"]), canonical_json(episode["event_ids"]), episode["motif"],
-                    episode.get("primary_asset_key"), episode.get("gross_usd"), canonical_json(episode.get("evidence", {})),
+                    episode.get("primary_asset_key"), episode.get("target_asset_key") or episode.get("primary_asset_key"), episode.get("gross_usd"), canonical_json(episode.get("evidence", {})),
                     episode.get("intent_label"), canonical_json(episode.get("intent", {})) if episode.get("intent") is not None else None,
                     episode.get("intent_confidence"), episode.get("classified_at"),
                 ),

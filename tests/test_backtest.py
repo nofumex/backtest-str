@@ -15,3 +15,10 @@ def test_backtest_builds_group(settings):
     assert set(frame["scope_type"]) == {"entity", "wallet"}
     assert frame.iloc[0]["negative_rate"]==1.0
     assert frame.iloc[0]["median_return"]<0
+
+
+def test_episode_target_asset_survives_sqlite_reload(settings):
+    s = Storage(settings)
+    s.save_episode({"episode_id":"target", "entity_id":"x", "start_ts":1, "end_ts":1, "wallets":[], "event_ids":[], "motif":"x", "primary_asset_key":"stable", "target_asset_key":"coingecko:ethereum", "evidence":{}})
+    row = s.fetchone("SELECT target_asset_key FROM episodes WHERE episode_id='target'")
+    assert row["target_asset_key"] == "coingecko:ethereum"

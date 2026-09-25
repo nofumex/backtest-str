@@ -40,6 +40,9 @@ async def enrich_evm_event(
         "rpc_receipt": rpc.evm(EVM_RPC_CHAIN[chain], "eth_getTransactionReceipt", [tx_hash]),
         "arkham_tx": arkham.tx(tx_hash),
     }
+    existing = storage.fetchall("SELECT source,payload_json FROM tx_enrichment WHERE tx_hash=? AND chain=?", (tx_hash, chain))
+    done = {r["source"] for r in existing}
+    tasks = {name: task for name, task in tasks.items() if name not in done}
     ok_chain = DEBANK_TO_OKLINK_CHAIN.get(chain)
     if ok_chain:
         tasks["oklink_detail"] = oklink.tx_detail(ok_chain, tx_hash)
@@ -52,6 +55,11 @@ async def enrich_evm_event(
     names = list(tasks)
     values = await asyncio.gather(*tasks.values(), return_exceptions=True)
     output: dict[str, Any] = {}
+    for row in existing:
+        try:
+            output[row["source"]] = json.loads(row["payload_json"])
+        except Exception:
+            pass
     for name, value in zip(names, values):
         if isinstance(value, Exception):
             output[name] = {"error": str(value)}
@@ -62,6 +70,8 @@ async def enrich_evm_event(
 
 
 async def snapshot_stargate_wallet(bridges: BridgeProvider, storage: Storage, *, entity_id: str, address: str, start_ts: int, end_ts: int) -> None:
+    if storage.position_exists(entity_id, address, "evm", "stargate.transfer_volume"):
+        return
     start = datetime.fromtimestamp(start_ts, timezone.utc).isoformat().replace("+00:00", "Z")
     end = datetime.fromtimestamp(end_ts, timezone.utc).isoformat().replace("+00:00", "Z")
     payload = await bridges.stargate_transfer_volume(address, start, end)

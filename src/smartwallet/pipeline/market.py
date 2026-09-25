@@ -58,15 +58,28 @@ class MarketLabeler:
         self.llama = llama
         self.storage = storage
         self._cache: dict[tuple[int, tuple[str, ...]], dict[str, Any]] = {}
+        self._inflight: dict[tuple[int, tuple[str, ...]], asyncio.Task] = {}
 
     async def prices(self, ts: int, coins: list[str]) -> dict[str, Any]:
         uniq = tuple(dict.fromkeys(coins))
         key = (int(ts), uniq)
         if key not in self._cache:
             cached = self.storage.market_price_get(int(ts), uniq)
-            self._cache[key] = cached if cached is not None else await self.llama.historical_prices(int(ts), list(uniq))
-            if cached is None and self._cache[key]:
-                self.storage.market_price_put(int(ts), uniq, self._cache[key])
+            if cached is not None:
+                self._cache[key] = cached
+            else:
+                task = self._inflight.get(key)
+                if task is None:
+                    async def fetch():
+                        value = await self.llama.historical_prices(int(ts), list(uniq))
+                        if value:
+                            self.storage.market_price_put(int(ts), uniq, value)
+                        return value
+                    task = self._inflight[key] = asyncio.create_task(fetch())
+                try:
+                    self._cache[key] = await task
+                finally:
+                    self._inflight.pop(key, None)
         return self._cache[key]
 
     async def label_episodes(self, episodes: list[dict[str, Any]], horizons: tuple[int, ...] = DEFAULT_HORIZONS, concurrency: int = 8) -> dict[str, int]:

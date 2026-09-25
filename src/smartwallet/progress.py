@@ -18,6 +18,11 @@ class ProgressDashboard:
     stage_number: int = 0
     completed: int = 0
     total: int = 0
+    api_metrics: dict[str, int] = field(default_factory=dict)
+    llm_done: int = 0
+    llm_total: int = 0
+    label_success: int = 0
+    label_failed: int = 0
     _last_render: float = 0.0
     _live: Live | None = None
 
@@ -30,9 +35,12 @@ class ProgressDashboard:
         if self._live:
             self._live.__exit__(*args)
 
-    def update(self, stage: str, number: int, completed: int = 0, total: int = 0) -> None:
+    def update(self, stage: str, number: int, completed: int = 0, total: int = 0, **metrics) -> None:
         self.stage, self.stage_number = stage, number
         self.completed, self.total = completed, total
+        self.api_metrics.update(metrics.get("api_metrics", {}))
+        self.llm_done, self.llm_total = metrics.get("llm_done", self.llm_done), metrics.get("llm_total", self.llm_total)
+        self.label_success, self.label_failed = metrics.get("label_success", self.label_success), metrics.get("label_failed", self.label_failed)
         now = time.monotonic()
         if self._live and now - self._last_render >= 0.2:
             self._last_render = now
@@ -42,7 +50,11 @@ class ProgressDashboard:
         table = Table(title="Smartwallet pipeline", expand=True)
         table.add_column("Stage")
         table.add_column("Progress")
-        table.add_column("Elapsed")
+        table.add_column("Elapsed / ETA")
+        table.add_column("API")
         pct = 100.0 * self.completed / self.total if self.total else 0.0
-        table.add_row(f"[{self.stage_number}/{self.total_stages}] {self.stage}", f"{pct:5.1f}% ({self.completed}/{self.total})", f"{time.monotonic()-self.started:,.1f}s")
+        elapsed = time.monotonic()-self.started
+        eta = elapsed * (100.0 / pct - 1.0) if pct > 0 else 0.0
+        api = self.api_metrics
+        table.add_row(f"[{self.stage_number}/{self.total_stages}] {self.stage}", f"{pct:5.1f}% ({self.completed}/{self.total})", f"{elapsed:,.1f}s / {eta:,.1f}s", f"{api.get('success',0)} ok, {api.get('cache_hit',0)} cache, {api.get('retry',0)} retry, {api.get('failed',0)} fail")
         return table

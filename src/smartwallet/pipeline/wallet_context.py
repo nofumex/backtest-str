@@ -45,15 +45,21 @@ async def snapshot_evm_wallet_context(
     saved = 0
     errors: list[dict[str, str]] = []
 
+    def needed(source: str, call):
+        return None if storage.position_exists(entity_id, address.lower(), "evm", source) else call()
     arkham_calls = {
-        "arkham.address_balances": arkham.address_balances(address),
-        "arkham.address_history": arkham.address_history(address),
-        "arkham.address_flow": arkham.address_flow(address),
-        "arkham.address_loans": arkham.address_loans(address),
+        "arkham.address_balances": needed("arkham.address_balances", lambda: arkham.address_balances(address)),
+        "arkham.address_history": needed("arkham.address_history", lambda: arkham.address_history(address)),
+        "arkham.address_flow": needed("arkham.address_flow", lambda: arkham.address_flow(address)),
+        "arkham.address_loans": needed("arkham.address_loans", lambda: arkham.address_loans(address)),
     }
     arkham_names = list(arkham_calls)
-    arkham_values = await asyncio.gather(*arkham_calls.values(), return_exceptions=True)
-    for name, value in zip(arkham_names, arkham_values):
+    arkham_values = await asyncio.gather(*(x for x in arkham_calls.values() if x is not None), return_exceptions=True)
+    value_iter = iter(arkham_values)
+    for name in arkham_names:
+        if arkham_calls[name] is None:
+            continue
+        value = next(value_iter)
         if isinstance(value, Exception):
             errors.append({"source": name, "error": str(value)})
             continue
@@ -66,14 +72,18 @@ async def snapshot_evm_wallet_context(
     )
     if any(str(r.get("source") or "").startswith("arkham.hypercore") for r in provenance):
         hyper_calls = {
-            "arkham.hypercore_account_perp": arkham.hypercore_account_perp(address),
-            "arkham.hypercore_account_spot": arkham.hypercore_account_spot(address),
-            "arkham.hypercore_account_portfolio": arkham.hypercore_account_portfolio(address),
-            "arkham.hypercore_account_summary": arkham.hypercore_account_summary(address),
+            "arkham.hypercore_account_perp": needed("arkham.hypercore_account_perp", lambda: arkham.hypercore_account_perp(address)),
+            "arkham.hypercore_account_spot": needed("arkham.hypercore_account_spot", lambda: arkham.hypercore_account_spot(address)),
+            "arkham.hypercore_account_portfolio": needed("arkham.hypercore_account_portfolio", lambda: arkham.hypercore_account_portfolio(address)),
+            "arkham.hypercore_account_summary": needed("arkham.hypercore_account_summary", lambda: arkham.hypercore_account_summary(address)),
         }
         hyper_names = list(hyper_calls)
-        hyper_values = await asyncio.gather(*hyper_calls.values(), return_exceptions=True)
-        for name, value in zip(hyper_names, hyper_values):
+        hyper_values = await asyncio.gather(*(x for x in hyper_calls.values() if x is not None), return_exceptions=True)
+        hyper_iter = iter(hyper_values)
+        for name in hyper_names:
+            if hyper_calls[name] is None:
+                continue
+            value = next(hyper_iter)
             if isinstance(value, Exception):
                 errors.append({"source": name, "error": str(value)})
                 continue
@@ -84,14 +94,18 @@ async def snapshot_evm_wallet_context(
         ok_chain = DEBANK_TO_OKLINK_CHAIN.get(debank_chain)
         if ok_chain:
             calls = {
-                "oklink.address_transactions": oklink.address_transactions(ok_chain, address, limit=20, offset=0, nonzero_value=False),
-                "oklink.token_transfers": oklink.token_transfers(ok_chain, address, limit=20, offset=0),
-                "oklink.internal_transactions": oklink.internal_transactions(ok_chain, address, limit=20, offset=0),
-                "oklink.defi_protocols": oklink.defi_protocols(ok_chain, address),
+                "oklink.address_transactions": needed(f"{debank_chain}:oklink.address_transactions", lambda: oklink.address_transactions(ok_chain, address, limit=20, offset=0, nonzero_value=False)),
+                "oklink.token_transfers": needed(f"{debank_chain}:oklink.token_transfers", lambda: oklink.token_transfers(ok_chain, address, limit=20, offset=0)),
+                "oklink.internal_transactions": needed(f"{debank_chain}:oklink.internal_transactions", lambda: oklink.internal_transactions(ok_chain, address, limit=20, offset=0)),
+                "oklink.defi_protocols": needed(f"{debank_chain}:oklink.defi_protocols", lambda: oklink.defi_protocols(ok_chain, address)),
             }
             names = list(calls)
-            values = await asyncio.gather(*calls.values(), return_exceptions=True)
-            for name, value in zip(names, values):
+            values = await asyncio.gather(*(x for x in calls.values() if x is not None), return_exceptions=True)
+            values_iter = iter(values)
+            for name in names:
+                if calls[name] is None:
+                    continue
+                value = next(values_iter)
                 if isinstance(value, Exception):
                     errors.append({"source": name, "error": str(value)})
                     continue
@@ -108,9 +122,12 @@ async def snapshot_evm_wallet_context(
             token_weights[(chain, token)] += float(r.get("usd_value") or 0.0)
     top_tokens = sorted(token_weights, key=lambda k: token_weights[k], reverse=True)[:max_tokens]
     for chain, token in top_tokens:
+        source = f"geckoterminal.token_pools:{token}"
+        if storage.position_exists(entity_id, address.lower(), chain, source):
+            continue
         try:
             payload = await gecko.token_pools(DEBANK_TO_GECKO_NETWORK[chain], token, page=1)
-            storage.save_position(entity_id, address.lower(), chain, f"geckoterminal.token_pools:{token}", payload)
+            storage.save_position(entity_id, address.lower(), chain, source, payload)
             saved += 1
         except Exception as exc:
             errors.append({"source": "geckoterminal.token_pools", "error": str(exc)})

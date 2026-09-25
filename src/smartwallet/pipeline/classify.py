@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import bisect
 from collections import Counter
 from typing import Any
 
@@ -37,6 +38,25 @@ def wallet_feature_payload(storage: Storage, entity_id: str, wallet: str, cutoff
         "cex_counts": dict(cex),
         "project_counts": dict(projects),
     }
+
+
+class WalletFeatureIndex:
+    """Preloads wallet events once and computes historical prefixes in memory."""
+    def __init__(self, storage: Storage, entity_id: str):
+        rows = storage.fetchall("SELECT action_type,chain,cex_id,project_id,usd_value,ts,wallet FROM wallet_events WHERE entity_id=? ORDER BY wallet,ts", (entity_id,))
+        self.rows: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            self.rows.setdefault(row["wallet"], []).append(row)
+
+    def payload(self, entity_id: str, wallet: str, cutoff_ts: int | None = None) -> dict[str, Any]:
+        rows = self.rows.get(wallet, [])
+        if cutoff_ts is not None:
+            rows = rows[:bisect.bisect_left([int(r["ts"]) for r in rows], cutoff_ts)]
+        actions = Counter(r["action_type"] for r in rows)
+        chains = Counter(r["chain"] for r in rows)
+        cex = Counter(r["cex_id"] for r in rows if r.get("cex_id"))
+        projects = Counter(r["project_id"] for r in rows if r.get("project_id"))
+        return {"entity_id": entity_id, "wallet": wallet, "event_count": len(rows), "first_ts": rows[0]["ts"] if rows else None, "last_ts": rows[-1]["ts"] if rows else None, "gross_usd": sum(float(r.get("usd_value") or 0) for r in rows), "action_counts": dict(actions), "chain_counts": dict(chains), "cex_counts": dict(cex), "project_counts": dict(projects)}
 
 
 async def _bounded_map(items: list[Any], worker, concurrency: int) -> list[Any]:
@@ -111,11 +131,12 @@ async def classify_episodes(
         sql += " AND intent_label IS NULL"
     sql += " ORDER BY start_ts"
     rows = storage.fetchall(sql, params)
+    feature_index = WalletFeatureIndex(storage, entity_id)
 
     async def worker(row):
         evidence = json.loads(row["evidence_json"])
         pre_event_profiles = {
-            wallet: wallet_feature_payload(storage, entity_id, wallet, cutoff_ts=int(row["start_ts"]))
+            wallet: feature_index.payload(entity_id, wallet, cutoff_ts=int(row["start_ts"]))
             for wallet in json.loads(row["wallets_json"])
         }
         payload = {

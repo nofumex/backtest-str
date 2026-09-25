@@ -43,6 +43,7 @@ class HubClient:
             transport=transport,
             follow_redirects=True,
         )
+        self.metrics = {"requests": 0, "success": 0, "cache_hit": 0, "retry": 0, "failed": 0}
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -93,11 +94,14 @@ class HubClient:
         last_exc: Exception | None = None
         for attempt in range(self.settings.http_retries):
             try:
+                self.metrics["requests"] += 1
                 resp = await self._client.request(spec.method, path, params=query, json=body if spec.method != "GET" else None)
                 if resp.status_code == 429:
+                    self.metrics["retry"] += 1
                     await asyncio.sleep(self._retry_after(resp, attempt))
                     continue
                 if 500 <= resp.status_code < 600:
+                    self.metrics["retry"] += 1
                     await asyncio.sleep(self._retry_after(resp, attempt))
                     continue
                 resp.raise_for_status()
@@ -107,9 +111,12 @@ class HubClient:
                 hub_status = int(payload.get("status", resp.status_code))
                 if hub_status >= 400 and not allow_upstream_error:
                     raise HubError(f"{endpoint_key}: upstream status={hub_status}, error={payload.get('error')!r}")
+                self.metrics["success"] += 1
                 return HubResponse(endpoint_key, hub_status, payload.get("data"), payload)
             except (httpx.TimeoutException, httpx.TransportError, json.JSONDecodeError, HubError) as exc:
                 last_exc = exc
+                if attempt + 1 >= self.settings.http_retries:
+                    self.metrics["failed"] += 1
                 # HubError for non-transient 4xx should not be retried.
                 if isinstance(exc, HubError) and "upstream status=4" in str(exc):
                     raise

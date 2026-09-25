@@ -41,8 +41,9 @@ async def backfill_evm_wallet(
     per_chain: dict[str, int] = {}
     pending: list[dict[str, Any]] = []
 
-    positions = await debank.positions(address)
-    storage.save_position(entity_id, address.lower(), "evm", "debank.portfolio_project_list", positions)
+    if not storage.position_exists(entity_id, address.lower(), "evm", "debank.portfolio_project_list"):
+        positions = await debank.positions(address)
+        storage.save_position(entity_id, address.lower(), "evm", "debank.portfolio_project_list", positions)
 
     for chain in chains:
         n = 0

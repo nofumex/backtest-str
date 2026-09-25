@@ -70,39 +70,43 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
     global_mean = float(raw_df["simple_return"].mean())
 
     expanded: list[dict[str, Any]] = []
+    broad_rows: list[dict[str, Any]] = []
     for row in rows:
         try:
             wallets = sorted({str(x) for x in json.loads(row["wallets_json"]) if x})
         except Exception:
             wallets = []
+        # Broad hypotheses are one row per episode/asset/horizon. Never expand them by pattern.
+        broad_rows.append({**row, "scope_type": "entity", "scope_id": row["entity_id"], "pattern": row["motif"]})
         pattern_values: list[str] = []
         for pattern in _patterns(row["evidence_json"], row["motif"]):
             pattern_values.append(pattern)
             if row.get("regime") and row["regime"] != "unknown":
                 pattern_values.append(f"REGIME:{row['regime']}|{pattern}")
         for pattern in sorted(set(pattern_values)):
-            expanded.append({**row, "scope_type": "entity", "scope_id": row["entity_id"], "pattern": pattern})
             for wallet in wallets:
                 expanded.append({**row, "scope_type": "wallet", "scope_id": wallet, "pattern": pattern})
     df = pd.DataFrame(expanded)
+    broad_df = pd.DataFrame(broad_rows)
 
     # Four nested hypotheses: broad entity/action, then intent, pattern, and wallet/asset.
     # The level is explicit so multiple observations do not create accidental duplicate tests.
-    has_specific_patterns = any(str(p).startswith(("ACTION:", "BIGRAM:", "TRIGRAM:", "ENDPOINT:")) for p in df["pattern"])
+    has_specific_patterns = not df.empty and any(str(p).startswith(("ACTION:", "BIGRAM:", "TRIGRAM:", "ENDPOINT:")) for p in df["pattern"])
     group_specs = [
         ("entity_action", ["entity_id", "motif", "horizon_seconds"]),
         ("wallet_pattern_intent_asset", ["entity_id", "scope_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
     ]
     if has_specific_patterns:
         group_specs[1:1] = [
-            ("entity_action_intent", ["entity_id", "motif", "intent_label", "horizon_seconds"]),
-            ("entity_pattern_intent", ["entity_id", "pattern", "intent_label", "horizon_seconds"]),
+            ("entity_action_intent", ["entity_id", "motif", "intent_label", "horizon_seconds", "asset_key"]),
+            ("entity_pattern_intent", ["entity_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
         ]
     if not has_specific_patterns:
         group_specs = [("entity_action", ["entity_id", "motif", "horizon_seconds"]), ("wallet", ["entity_id", "scope_id", "horizon_seconds"])]
     results: list[dict[str, Any]] = []
     for level, group_cols in group_specs:
-      for keys, g in df.groupby(group_cols, dropna=False):
+      source_df = broad_df if level == "entity_action" else df
+      for keys, g in source_df.groupby(group_cols, dropna=False):
         if level == "wallet" and all(g["scope_id"] == g["entity_id"]):
             continue
         if len(g) < min_n:
@@ -123,7 +127,11 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
         key_map.setdefault("pattern", "ACTION:any")
         key_map.setdefault("motif", "ACTION:any")
         key_map.setdefault("intent_label", "unknown")
-        key_map.setdefault("asset_key", str(g["asset_key"].iloc[0]))
+        if "asset_key" not in key_map:
+            # An estimate must never silently mix assets or choose the first asset.
+            if g["asset_key"].nunique(dropna=False) != 1:
+                continue
+            key_map["asset_key"] = str(g["asset_key"].iloc[0])
         key_map["scope_type"] = "wallet" if level.startswith("wallet") else "entity"
         key_map["level"] = level
         prior_key = (key_map["entity_id"], key_map["intent_label"], key_map["horizon_seconds"], key_map["asset_key"])
