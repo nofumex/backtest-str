@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartwallet-intent-backtest"
+version = "1.0.0"
+description = "Entity-specific smart-wallet intent modeling and backtesting over API Hub"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27,<1",
+  "python-dotenv>=1,<2",
+  "PyYAML>=6,<7",
+  "typer>=0.12,<1",
+  "rich>=13,<15",
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "scipy>=1.12,<2",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=15,<30"]
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
+
+[project.scripts]
+smartwallet = "smartwallet.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,11 @@
+# Known limitations and deliberate boundaries
+
+1. **Full Arkham EVM entity address enumeration is not available through the documented routes used here.** The project therefore models confirmed active wallet seeds rather than pretending the known set is complete.
+2. **Arkham entity-filtered transfer history is not required by this implementation.** EVM historical wallet activity is obtained from DeBank; OKLink/RPC are verification/enrichment layers.
+3. **Arkham Solana entity subaccounts have no documented pagination.** Live tests produced exactly 1000 balance rows for some entities, so owner-address extraction should be treated as a confirmed seed set, not a proof of completeness.
+4. **Jupiter activity object fields are not invented.** The Hub endpoint documents the container (`histories`, `hasMoreData`) but not the complete row schema. The project archives the raw Solana surfaces and current positions. EVM is the fully normalized behavioral path in this release.
+5. **Bridge evidence is provider-specific.** LI.FI and Rubic can identify transfers routed through their systems by source transaction hash. Absence of a match does not prove that a transaction was not a bridge.
+6. **Historical funding/open-interest is not fabricated.** The documented OKX routes used here provide current funding and open interest. They are stored as live context. Historical price response and pre-event regime use DefiLlama point-in-time prices.
+7. **Intent is probabilistic.** OTC settlement, internal settlement, collateral use and market-making inventory cannot always be uniquely recovered from public chain data. The classifier is required to preserve uncertainty.
+8. **OKLink address endpoints expose `offset` but Hub marks their response pagination as `none` and does not document nested row fields.** The project snapshots those address-level surfaces verbatim and uses transaction detail/log routes for per-tx verification; it does not invent a fake “complete OKLink history” parser.
+9. **GeckoTerminal token-pool rows are preserved raw.** Hub documents the `data` array but not every pool-item field on that route, so the project does not guess pool addresses/volume fields from undocumented nested structure.
