@@ -66,6 +66,7 @@ class MarketLabeler:
         if key not in self._cache:
             cached = self.storage.market_price_get(int(ts), uniq)
             if cached is not None:
+                self.llama.hub.metrics["cache_hit"] = self.llama.hub.metrics.get("cache_hit", 0) + 1
                 self._cache[key] = cached
             else:
                 task = self._inflight.get(key)
@@ -82,13 +83,16 @@ class MarketLabeler:
                     self._inflight.pop(key, None)
         return self._cache[key]
 
-    async def label_episodes(self, episodes: list[dict[str, Any]], horizons: tuple[int, ...] = DEFAULT_HORIZONS, concurrency: int = 8) -> dict[str, int]:
+    async def label_episodes(self, episodes: list[dict[str, Any]], horizons: tuple[int, ...] = DEFAULT_HORIZONS, concurrency: int = 8, progress=None) -> dict[str, int]:
         sem = asyncio.Semaphore(max(1, concurrency))
         async def one(ep):
             async with sem:
                 try:
-                    return await self.label_episode(ep, horizons), False
+                    n = await self.label_episode(ep, horizons)
+                    if progress: progress(success=n, failed=0)
+                    return n, False
                 except Exception:
+                    if progress: progress(success=0, failed=1)
                     return 0, True
         results = await asyncio.gather(*(one(ep) for ep in episodes))
         return {"labels": sum(n for n, _ in results), "failed": sum(f for _, f in results)}

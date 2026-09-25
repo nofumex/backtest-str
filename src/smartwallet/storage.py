@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -230,6 +231,7 @@ class Storage:
         settings.raw_dir.mkdir(parents=True, exist_ok=True)
         settings.report_dir.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._archive_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="raw-writer")
         with self.conn() as db:
             db.executescript(SCHEMA)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(episodes)")}
@@ -237,9 +239,19 @@ class Storage:
                 db.execute("ALTER TABLE episodes ADD COLUMN target_asset_key TEXT")
                 db.execute("UPDATE episodes SET target_asset_key=primary_asset_key WHERE target_asset_key IS NULL")
 
+    def close(self) -> None:
+        self._archive_executor.shutdown(wait=True)
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            db.close()
+            self._local.db = None
+
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.settings.db_path, timeout=30)
-        db.row_factory = sqlite3.Row
+        db = getattr(self._local, "db", None)
+        if db is None:
+            db = sqlite3.connect(self.settings.db_path, timeout=30)
+            db.row_factory = sqlite3.Row
+            self._local.db = db
         return db
 
     @contextmanager
@@ -252,7 +264,7 @@ class Storage:
             db.rollback()
             raise
         finally:
-            db.close()
+            pass
 
     def archive_raw(self, provider: str, endpoint_key: str, request: dict[str, Any], response: Any) -> str:
         record = {
@@ -277,6 +289,9 @@ class Storage:
                 (provider, endpoint_key, canonical_json(request), canonical_json(response), record["fetched_at"], digest),
             )
         return digest
+
+    def archive_raw_queued(self, provider: str, endpoint_key: str, request: dict[str, Any], response: Any) -> Future:
+        return self._archive_executor.submit(self.archive_raw, provider, endpoint_key, request, response)
 
     def upsert_entity(self, entity_id: str, name: str | None, summary: dict[str, Any], metadata: dict[str, Any] | None = None) -> None:
         with self.conn() as db:
@@ -323,14 +338,15 @@ class Storage:
                 (entity_id, source, kind, utc_now_iso(), canonical_json(payload)),
             )
 
-    def save_position(self, entity_id: str, address: str, chain: str, source: str, payload: Any) -> None:
+    def save_position(self, entity_id: str, address: str, chain: str, source: str, payload: Any, request_key: str | None = None) -> None:
         with self.conn() as db:
             db.execute(
                 "INSERT OR REPLACE INTO wallet_positions(entity_id,address,chain,source,captured_at,payload_json) VALUES(?,?,?,?,?,?)",
-                (entity_id, address, chain, source, utc_now_iso(), canonical_json(payload)),
+                (entity_id, address, chain, f"{source}|{request_key}" if request_key else source, utc_now_iso(), canonical_json(payload)),
             )
 
-    def position_exists(self, entity_id: str, address: str, chain: str, source: str) -> bool:
+    def position_exists(self, entity_id: str, address: str, chain: str, source: str, request_key: str | None = None) -> bool:
+        source = f"{source}|{request_key}" if request_key else source
         return self.fetchone("SELECT 1 FROM wallet_positions WHERE entity_id=? AND address=? AND chain=? AND source=? LIMIT 1", (entity_id, address, chain, source)) is not None
 
     def enrichment_exists(self, tx_hash: str, chain: str, source: str) -> bool:
@@ -339,7 +355,7 @@ class Storage:
     def save_event(self, event: dict[str, Any]) -> None:
         with self.conn() as db:
             db.execute(
-                """INSERT OR REPLACE INTO wallet_events(
+                """INSERT OR IGNORE INTO wallet_events(
                    event_id,entity_id,wallet,chain,tx_hash,event_index,ts,source,action_type,cate_id,cex_id,project_id,
                    usd_value,primary_token_id,primary_asset_key,evidence_json,raw_json,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -363,7 +379,7 @@ class Storage:
             return
         with self.conn() as db:
             db.executemany(
-                """INSERT OR REPLACE INTO wallet_events(event_id,entity_id,wallet,chain,tx_hash,event_index,ts,source,
+                """INSERT OR IGNORE INTO wallet_events(event_id,entity_id,wallet,chain,tx_hash,event_index,ts,source,
                 action_type,cate_id,cex_id,project_id,usd_value,primary_token_id,primary_asset_key,evidence_json,raw_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values,
             )
@@ -397,8 +413,13 @@ class Storage:
     def save_episode(self, episode: dict[str, Any]) -> None:
         with self.conn() as db:
             db.execute(
-                """INSERT OR REPLACE INTO episodes(episode_id,entity_id,start_ts,end_ts,wallets_json,event_ids_json,motif,primary_asset_key,target_asset_key,gross_usd,evidence_json,
-                   intent_label,intent_json,intent_confidence,classified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO episodes(episode_id,entity_id,start_ts,end_ts,wallets_json,event_ids_json,motif,primary_asset_key,target_asset_key,gross_usd,evidence_json,
+                   intent_label,intent_json,intent_confidence,classified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(episode_id) DO UPDATE SET
+                     entity_id=excluded.entity_id,start_ts=excluded.start_ts,end_ts=excluded.end_ts,
+                     wallets_json=excluded.wallets_json,event_ids_json=excluded.event_ids_json,motif=excluded.motif,
+                     primary_asset_key=excluded.primary_asset_key,target_asset_key=excluded.target_asset_key,
+                     gross_usd=excluded.gross_usd,evidence_json=excluded.evidence_json""",
                 (
                     episode["episode_id"], episode["entity_id"], episode["start_ts"], episode["end_ts"],
                     canonical_json(episode["wallets"]), canonical_json(episode["event_ids"]), episode["motif"],

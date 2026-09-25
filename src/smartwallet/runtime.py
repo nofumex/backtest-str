@@ -51,3 +51,4 @@ class Runtime:
     async def aclose(self) -> None:
         await self.llm.aclose()
         await self.hub.aclose()
+        self.storage.close()

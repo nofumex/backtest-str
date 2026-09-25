@@ -1,156 +1,103 @@
-# Smart-wallet Intent Backtest
+# Smartwallet Research Terminal
 
-A complete first-run pipeline for the idea: **model what a specific institutional smart wallet appears to be doing, then test whether that exact behavior historically had predictive value**.
+Live, restart-safe research and backtesting for institutional smart wallets. The browser controls historical collection, episode construction, LLM intent classification, market labeling and incremental statistical analysis.
 
-The system does not implement `wallet -> Binance = short`. It builds factual action sequences, keeps entity/wallet identity separate from counterparties, asks an LLM for a probability distribution over economic intent, and only afterwards joins future prices for backtesting.
+## Run it
 
-## Sources used by the implementation
-
-The Hub contract is based on `https://hub.arbitron.dev/llms.txt` and the per-route documentation under `https://hub.arbitron.dev/providers/...`. Every Hub call is allowlisted in `src/smartwallet/contracts.py`; undocumented query parameters are rejected before HTTP.
-
-Core surfaces:
-
-- Arkham: entity identity/summary/balances, history, flow, volume, loans, Hypercore, Solana entity subaccounts, search, recent swaps, transaction attribution.
-- DeBank: `history/list`, `user/used_chains`, `portfolio/project_list`.
-- OKLink: classified address transactions, token transfers, internal transactions, DeFi protocol list, transaction detail/logs.
-- Hub RPC: documented safe read methods (`eth_getTransactionReceipt` etc.).
-- LI.FI + Rubic: cross-chain status by source transaction hash.
-- Stargate: address-level outgoing bridge volume over a date range.
-- Jupiter Portfolio: Solana wallet activity/positions/transfers/trades.
-- DefiLlama: historical point-in-time token prices.
-- OKX Web3: current public funding rate / open interest plus documented historical candles client.
-- GeckoTerminal: documented pool discovery and OHLCV client.
-
-## Tracked entities
-
-Default config:
-
-- `wintermute`
-- `jump-trading`
-- `cumberland`
-- `galaxy-digital`
-- `amber`
-
-Edit `config/entities.yaml` to change the universe.
-
-## Install
-
-```bash
-cd backtest-str-smartwallet
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-```
-
-Your existing `.env` can be placed in the project root. Required variables:
+Requirements: Python 3.11+, Node.js 20+ and the credentials below in `.env`:
 
 ```dotenv
 API_HUB_KEY=...
 FREE_LLM_API=...
-```
-
-The requested LLM defaults are already configured:
-
-```dotenv
 FREE_LLM_BASE_URL=http://159.194.241.69:3001/v1
 FREE_LLM_MODEL=llama-3.3-70b-versatile
 ```
 
-If that gateway exposes the desired chat model under another name, override only `FREE_LLM_MODEL`; the client still uses the user-specified `/v1/chat/completions` surface.
-
-## Verify before a full run
+Development — one command after install:
 
 ```bash
-smartwallet doctor
-smartwallet contracts > hub-contract.json
-pytest -q
-smartwallet doctor --live
+npm install
+npm run dev
 ```
 
-`doctor --live` performs one documented Arkham entity-summary call. No secret is printed.
+Open **http://localhost:5173**. Vite proxies the API to the Python process; both processes are managed by the single npm command.
 
-## Full pipeline
-
-Two-year-plus example:
+Production:
 
 ```bash
-smartwallet run-all --from 2024-01-01
+npm install
+npm run build
+pm2 start ecosystem.config.cjs --only backtest-str
 ```
 
-Stages executed in order:
+Open **http://SERVER_IP:8000**. FastAPI serves the built frontend and owns all background work. Set `PORT` to use another port.
 
-1. discover confirmed Arkham wallet seeds;
-2. save full entity context (`balances/history/flow/volume/loans/Hypercore`);
-3. backfill every discovered EVM wallet through documented DeBank cursor pagination and collect Solana Jupiter surfaces;
-4. snapshot indexed wallet context from OKLink (classified tx / token transfers / internals / DeFi protocols) and current top token pools from GeckoTerminal;
-5. collect Stargate address bridge-volume context;
-6. verify/enrich EVM transactions with Arkham tx + OKLink tx/logs + Hub RPC and check LI.FI/Rubic bridge status;
-7. build bounded multi-wallet episodes and hierarchical action/bigram/trigram/endpoint patterns;
-8. classify wallet roles and episode intent with `FREE_LLM_API`;
-9. build pre-event BTC/ETH market regime from DefiLlama historical prices, then label 5m / 1h / 6h / 1d / 3d future returns and excess returns;
-10. capture current OKX funding/OI context;
-11. run hierarchical entity/action, entity/action/intent, entity/pattern/intent and wallet/pattern/intent/asset estimates with shrinkage priors, bootstrap CI, sign test, BH q-values and chronological holdout;
-12. write CSV, JSON and HTML reports under `data/reports/`.
+## What the terminal does
 
-### Expensive/full vs diagnostic runs
+- creates durable analysis runs with explicit entity and date scope;
+- starts, pauses, resumes and safely stops work at wallet/batch boundaries;
+- marks interrupted work as paused after a process/VPS restart so it can be resumed;
+- shows real wallet, event, episode, classification, label, API, queue and database counters;
+- streams a dashboard snapshot through SSE every two seconds without coupling logs to the pipeline;
+- shows entity-level coverage, data-quality gaps, errors and run history;
+- builds pattern cards from real completed observations and exposes their source episodes;
+- stores sample-size checkpoints and a discovery feed as results evolve;
+- keeps the existing developer CLI available (`smartwallet --help`).
 
-The full command has no wallet/page cap. To test wiring first:
+## Incremental architecture
+
+The application remains a single FastAPI process with asyncio background tasks. Existing provider, normalizer, episode, LLM and market-labeling functions are reused; the web layer does not implement a second research pipeline.
+
+SQLite stays in WAL mode. Web/run tables live beside the existing research tables:
+
+```text
+provider backfill → normalized wallet_events
+                         ↓ new rowid watermark per entity/run
+              dirty time-window episode rebuild
+                         ↓ only unclassified episodes
+                 LLM intent classification
+                         ↓ only incomplete episodes
+                   future market labels
+                         ↓ deduplicated run observations
+        cheap incremental aggregates + sample checkpoints
+                         ↓ periodically / meaningful Δn
+              bootstrap, holdout and BH refresh
+                         ↓
+                    SSE dashboard
+```
+
+Cheap statistics update after new observations by rebuilding only affected pattern groups. The system does not rescan the full multi-year dataset every 30 seconds. Expensive checks run when at least 10 observations or 20% sample growth has accumulated, during periodic refreshes and at final drain. Each observation has a run-scoped deterministic key, so resume/retry is idempotent.
+
+Research data and API response cache may be reused across runs, but `analysis_observations`, aggregates, checkpoints, feed and dashboard results are scoped by `run_id`, entity set and date range. Old runs therefore remain attributable and inspectable.
+
+## Statistical maturity
+
+Maturity is a conservative display state, not a trading signal. The exact rules are implemented in `smartwallet.incremental.maturity_for`:
+
+- **EARLY**: `n < 20`, regardless of effect size or p-value.
+- **PROMISING**: `n >= 20`; enough for preliminary inspection, but robustness conditions are not met.
+- **ESTABLISHING**: `n >= 50`, bootstrap 95% CI excludes zero, train and chronological holdout means have the same sign, and holdout directional accuracy is at least 55%.
+- **ROBUST**: `n >= 100`, all establishing conditions hold, Benjamini–Hochberg `q <= 0.05`, and holdout directional accuracy is at least 60%.
+
+Cards always show `n`. Advanced statistics include mean, median, bootstrap CI, sign-test p-value, BH q-value, train/holdout sizes, holdout accuracy and the shrinkage estimate. “Robust” means robust under these historical checks only; it is not investment advice and does not establish causality.
+
+## Data and operations
+
+Default paths:
+
+- SQLite: `data/smartwallet.db`
+- immutable raw responses: `data/raw/`
+- legacy CLI reports: `data/reports/`
+
+Useful environment overrides include `SMARTWALLET_DB`, `SMARTWALLET_RAW_DIR`, `SMARTWALLET_REPORT_DIR`, `SMARTWALLET_CONCURRENCY`, `SMARTWALLET_HTTP_TIMEOUT` and `PORT`.
+
+Run automated checks with:
 
 ```bash
-smartwallet run-all --from 2026-01-01 --max-wallets 5 --max-pages 2 --max-enrich-events 20 --max-market-episodes 30
+npm test
+npm run build
 ```
 
-Then remove the caps for the real backfill. For maximum deep transaction enrichment rather than the practical default, also pass `--enrich-min-usd 0`; this can multiply the number of Hub calls on high-frequency market-maker wallets.
+Authenticated throughput and full-history duration depend on provider limits, selected entities, cache warmth and VPS resources. They cannot be benchmarked honestly without spending the configured API/LLM credentials; the live terminal reports the actual rates for each run.
 
-The diagnostic cap is applied independently for each configured entity, so a run capped at five wallets still exercises every configured entity. Market price points are deduplicated and persisted in SQLite; normalized events and classifications are idempotent and can resume after interruption. Future labels with unavailable prices are not counted as successful labels.
-
-`run-all` displays a low-overhead live stage dashboard and stage timings. For a reproducible profile, use a clean temporary database and compare emitted stage timings:
-
-```bash
-SMARTWALLET_DB=/tmp/smartwallet-diagnostic.db smartwallet run-all --from 2026-01-01 --max-wallets 5 --max-pages 2 --max-enrich-events 20 --max-market-episodes 30
-```
-
-This checkout has no credentials, so an authenticated before/after Hub benchmark cannot be honestly reported here. Request counts and stage timings are emitted when credentials are supplied.
-
-## Individual stages
-
-```bash
-smartwallet discover
-smartwallet snapshot-entities
-smartwallet backfill --from 2024-01-01
-smartwallet wallet-context
-smartwallet enrich --min-usd 100000
-smartwallet stargate-context --from 2024-01-01
-smartwallet episodes
-smartwallet classify
-smartwallet label-market
-smartwallet backtest --min-n 5
-```
-
-## Important design choices
-
-### No whale-copy shortcut
-
-A DeBank event with `cex_id` and outgoing tokens becomes factual `CEX_INTERACTION_OUT`, **not `SELL`**. Sell intent is one probability among several LLM outputs.
-
-### No fake ownership graph
-
-Counterparties are not promoted to owned wallets. Discovery uses only Arkham-confirmed surfaces. This avoids contaminating a market-maker entity with pools, routers and ordinary users.
-
-### No future leakage
-
-The LLM is run before market labeling. Historical entity context is selected only at or before episode start. Wallet profiles sent to historical episode classification contain only events strictly earlier than the episode. Pre-event market regime uses only `t-24h ... t`; future returns live in a separate table.
-
-### Entity + individual-wallet behavior memory
-
-Backtests are emitted at both scopes. A wallet-specific pattern estimate is shrinkage-regularized toward the same entity + intent + asset + horizon prior, so a thin wallet history cannot overpower the broader entity evidence.
-
-### Hierarchical sequence patterns
-
-Each episode emits broad and specific hypotheses: action unigrams, bigrams, trigrams, first→last endpoints and short full sequences. CEX / protocol IDs are retained in pattern tokens. This avoids the useless situation where every long market-maker episode is a unique exact string.
-
-### Reproducibility
-
-Every external Hub response is archived immutably as gzip JSON under `data/raw/<provider>/<date>/`, while normalized state is stored in SQLite/WAL. Re-running normalization/backtesting does not require silently changing the raw evidence.
-
-See `docs/ARCHITECTURE.md`, `docs/HUB_CONTRACT.md` and `docs/LIMITATIONS.md`.
+More details: [architecture](docs/ARCHITECTURE.md), [provider contract](docs/HUB_CONTRACT.md), [limitations](docs/LIMITATIONS.md), and [validation](docs/VALIDATION.md).

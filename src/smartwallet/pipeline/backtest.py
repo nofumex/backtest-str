@@ -69,7 +69,8 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
     prior_means = raw_df.groupby(prior_cols, dropna=False)["simple_return"].mean().to_dict()
     global_mean = float(raw_df["simple_return"].mean())
 
-    expanded: list[dict[str, Any]] = []
+    entity_pattern_rows: list[dict[str, Any]] = []
+    wallet_pattern_rows: list[dict[str, Any]] = []
     broad_rows: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -77,38 +78,39 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
         except Exception:
             wallets = []
         # Broad hypotheses are one row per episode/asset/horizon. Never expand them by pattern.
-        broad_rows.append({**row, "scope_type": "entity", "scope_id": row["entity_id"], "pattern": row["motif"]})
+        action = str(row["motif"]).split(">", 1)[0] or "unknown"
+        broad_rows.append({**row, "scope_type": "entity", "scope_id": row["entity_id"], "action": action, "pattern": action})
         pattern_values: list[str] = []
         for pattern in _patterns(row["evidence_json"], row["motif"]):
             pattern_values.append(pattern)
             if row.get("regime") and row["regime"] != "unknown":
                 pattern_values.append(f"REGIME:{row['regime']}|{pattern}")
         for pattern in sorted(set(pattern_values)):
+            entity_pattern_rows.append({**row, "scope_type": "entity", "scope_id": row["entity_id"], "pattern": pattern})
             for wallet in wallets:
-                expanded.append({**row, "scope_type": "wallet", "scope_id": wallet, "pattern": pattern})
-    df = pd.DataFrame(expanded)
+                wallet_pattern_rows.append({**row, "scope_type": "wallet", "scope_id": wallet, "pattern": pattern})
     broad_df = pd.DataFrame(broad_rows)
+    entity_pattern_df = pd.DataFrame(entity_pattern_rows).drop_duplicates(subset=["episode_id", "asset_key", "horizon_seconds", "pattern"])
+    wallet_pattern_df = pd.DataFrame(wallet_pattern_rows).drop_duplicates(subset=["episode_id", "asset_key", "horizon_seconds", "scope_id", "pattern"])
+    has_patterns = any(
+        isinstance((json.loads(r["evidence_json"]) if r["evidence_json"] else {}).get("patterns"), list)
+        for r in rows
+    )
 
     # Four nested hypotheses: broad entity/action, then intent, pattern, and wallet/asset.
     # The level is explicit so multiple observations do not create accidental duplicate tests.
-    has_specific_patterns = not df.empty and any(str(p).startswith(("ACTION:", "BIGRAM:", "TRIGRAM:", "ENDPOINT:")) for p in df["pattern"])
     group_specs = [
-        ("entity_action", ["entity_id", "motif", "horizon_seconds"]),
-        ("wallet_pattern_intent_asset", ["entity_id", "scope_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
+        ("entity_action", broad_df, ["entity_id", "action", "intent_label", "horizon_seconds", "asset_key"]),
+        ("wallet_pattern_intent_asset", wallet_pattern_df, ["entity_id", "scope_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
     ]
-    if has_specific_patterns:
-        group_specs[1:1] = [
-            ("entity_action_intent", ["entity_id", "motif", "intent_label", "horizon_seconds", "asset_key"]),
-            ("entity_pattern_intent", ["entity_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
-        ]
-    if not has_specific_patterns:
-        group_specs = [("entity_action", ["entity_id", "motif", "horizon_seconds"]), ("wallet", ["entity_id", "scope_id", "horizon_seconds"])]
+    if has_patterns:
+        group_specs.insert(1, ("entity_action_intent", broad_df, ["entity_id", "action", "intent_label", "horizon_seconds", "asset_key"]))
+        group_specs.insert(2, ("entity_pattern_intent", entity_pattern_df, ["entity_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]))
     results: list[dict[str, Any]] = []
-    for level, group_cols in group_specs:
-      source_df = broad_df if level == "entity_action" else df
+    for level, source_df, group_cols in group_specs:
+      if source_df.empty:
+        continue
       for keys, g in source_df.groupby(group_cols, dropna=False):
-        if level == "wallet" and all(g["scope_id"] == g["entity_id"]):
-            continue
         if len(g) < min_n:
             continue
         vals = g["simple_return"].astype(float).to_numpy()
@@ -125,7 +127,7 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
         key_map = dict(zip(group_cols, keys))
         key_map.setdefault("scope_id", key_map.get("entity_id"))
         key_map.setdefault("pattern", "ACTION:any")
-        key_map.setdefault("motif", "ACTION:any")
+        key_map.setdefault("motif", key_map.get("action", "ACTION:any"))
         key_map.setdefault("intent_label", "unknown")
         if "asset_key" not in key_map:
             # An estimate must never silently mix assets or choose the first asset.
@@ -139,7 +141,7 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
         shrunk = (len(vals) * float(np.mean(vals)) + shrinkage_strength * prior_mean) / (len(vals) + shrinkage_strength)
         results.append({
             **key_map,
-            "motif": f"{level}:{key_map.get('pattern', key_map['motif'])}",
+            "motif": f"{level}:{key_map.get('pattern', key_map.get('action', key_map['motif']))}",
             "n": len(vals),
             "mean_return": float(np.mean(vals)),
             "median_return": float(np.median(vals)),

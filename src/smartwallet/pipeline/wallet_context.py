@@ -45,8 +45,8 @@ async def snapshot_evm_wallet_context(
     saved = 0
     errors: list[dict[str, str]] = []
 
-    def needed(source: str, call):
-        return None if storage.position_exists(entity_id, address.lower(), "evm", source) else call()
+    def needed(source: str, call, chain: str = "evm"):
+        return None if storage.position_exists(entity_id, address.lower(), chain, source) else call()
     arkham_calls = {
         "arkham.address_balances": needed("arkham.address_balances", lambda: arkham.address_balances(address)),
         "arkham.address_history": needed("arkham.address_history", lambda: arkham.address_history(address)),
@@ -72,10 +72,10 @@ async def snapshot_evm_wallet_context(
     )
     if any(str(r.get("source") or "").startswith("arkham.hypercore") for r in provenance):
         hyper_calls = {
-            "arkham.hypercore_account_perp": needed("arkham.hypercore_account_perp", lambda: arkham.hypercore_account_perp(address)),
-            "arkham.hypercore_account_spot": needed("arkham.hypercore_account_spot", lambda: arkham.hypercore_account_spot(address)),
-            "arkham.hypercore_account_portfolio": needed("arkham.hypercore_account_portfolio", lambda: arkham.hypercore_account_portfolio(address)),
-            "arkham.hypercore_account_summary": needed("arkham.hypercore_account_summary", lambda: arkham.hypercore_account_summary(address)),
+            "arkham.hypercore_account_perp": needed("arkham.hypercore_account_perp", lambda: arkham.hypercore_account_perp(address), "hypercore"),
+            "arkham.hypercore_account_spot": needed("arkham.hypercore_account_spot", lambda: arkham.hypercore_account_spot(address), "hypercore"),
+            "arkham.hypercore_account_portfolio": needed("arkham.hypercore_account_portfolio", lambda: arkham.hypercore_account_portfolio(address), "hypercore"),
+            "arkham.hypercore_account_summary": needed("arkham.hypercore_account_summary", lambda: arkham.hypercore_account_summary(address), "hypercore"),
         }
         hyper_names = list(hyper_calls)
         hyper_values = await asyncio.gather(*(x for x in hyper_calls.values() if x is not None), return_exceptions=True)
@@ -94,10 +94,10 @@ async def snapshot_evm_wallet_context(
         ok_chain = DEBANK_TO_OKLINK_CHAIN.get(debank_chain)
         if ok_chain:
             calls = {
-                "oklink.address_transactions": needed(f"{debank_chain}:oklink.address_transactions", lambda: oklink.address_transactions(ok_chain, address, limit=20, offset=0, nonzero_value=False)),
-                "oklink.token_transfers": needed(f"{debank_chain}:oklink.token_transfers", lambda: oklink.token_transfers(ok_chain, address, limit=20, offset=0)),
-                "oklink.internal_transactions": needed(f"{debank_chain}:oklink.internal_transactions", lambda: oklink.internal_transactions(ok_chain, address, limit=20, offset=0)),
-                "oklink.defi_protocols": needed(f"{debank_chain}:oklink.defi_protocols", lambda: oklink.defi_protocols(ok_chain, address)),
+                "oklink.address_transactions": needed("oklink.address_transactions", lambda: oklink.address_transactions(ok_chain, address, limit=20, offset=0, nonzero_value=False), debank_chain),
+                "oklink.token_transfers": needed("oklink.token_transfers", lambda: oklink.token_transfers(ok_chain, address, limit=20, offset=0), debank_chain),
+                "oklink.internal_transactions": needed("oklink.internal_transactions", lambda: oklink.internal_transactions(ok_chain, address, limit=20, offset=0), debank_chain),
+                "oklink.defi_protocols": needed("oklink.defi_protocols", lambda: oklink.defi_protocols(ok_chain, address), debank_chain),
             }
             names = list(calls)
             values = await asyncio.gather(*(x for x in calls.values() if x is not None), return_exceptions=True)

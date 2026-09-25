@@ -6,11 +6,16 @@ src/smartwallet/cli.py
 src/smartwallet/config.py
 src/smartwallet/contracts.py
 src/smartwallet/http.py
+src/smartwallet/incremental.py
 src/smartwallet/llm.py
 src/smartwallet/normalize.py
+src/smartwallet/orchestrator.py
+src/smartwallet/progress.py
 src/smartwallet/runtime.py
 src/smartwallet/settings.py
 src/smartwallet/storage.py
+src/smartwallet/web.py
+src/smartwallet/webdb.py
 src/smartwallet/pipeline/__init__.py
 src/smartwallet/pipeline/backfill.py
 src/smartwallet/pipeline/backtest.py
@@ -44,6 +49,7 @@ tests/test_contracts.py
 tests/test_debank_pagination.py
 tests/test_episodes.py
 tests/test_llm.py
+tests/test_llm_resilience.py
 tests/test_market.py
 tests/test_no_direct_hub_routes.py
 tests/test_normalize.py

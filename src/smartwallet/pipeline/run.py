@@ -19,11 +19,14 @@ from .wallet_context import snapshot_evm_wallet_context
 from ..progress import ProgressDashboard
 
 
-async def bounded_gather(coros: list[Any], limit: int) -> list[Any]:
+async def bounded_gather(coros: list[Any], limit: int, progress=None) -> list[Any]:
     sem = asyncio.Semaphore(limit)
     async def run(c):
         async with sem:
-            return await c
+            result = await c
+            if progress:
+                progress()
+            return result
     return await asyncio.gather(*(run(c) for c in coros), return_exceptions=True)
 
 
@@ -140,12 +143,12 @@ async def classify_all(rt: Runtime, entity_config: str = "config/entities.yaml",
     return out
 
 
-async def label_all_markets(rt: Runtime, *, max_episodes: int | None = None) -> int:
+async def label_all_markets(rt: Runtime, *, max_episodes: int | None = None, progress=None) -> int:
     rows = rt.storage.fetchall("SELECT * FROM episodes WHERE COALESCE(target_asset_key, primary_asset_key) IS NOT NULL ORDER BY start_ts")
     if max_episodes:
         rows = rows[:max_episodes]
     labeler = MarketLabeler(rt.llama, rt.storage)
-    result = await labeler.label_episodes(rows, concurrency=rt.settings.concurrency)
+    result = await labeler.label_episodes(rows, concurrency=rt.settings.concurrency, progress=progress)
     return result["labels"]
 
 
@@ -170,12 +173,13 @@ async def run_all(
         nonlocal stage_number
         stage_number += 1
         stage_started = time.monotonic()
-        dashboard.update(name, stage_number)
+        dashboard.update(name, stage_number, 0, 1, api_metrics=rt.hub.metrics)
         print(f"[run-all] START {name}", flush=True)
         value = await awaitable
         completed = len(value) if isinstance(value, (list, dict)) else int(value or 0) if isinstance(value, int) else 1
         dashboard.update(name, stage_number, completed, max(completed, 1), api_metrics=rt.hub.metrics)
         elapsed = time.monotonic() - stage_started
+        dashboard.stage_done(name, elapsed)
         print(f"[run-all] DONE  {name} ({elapsed:.1f}s, total {time.monotonic() - started:.1f}s)", flush=True)
         return value
     with dashboard:
@@ -187,7 +191,10 @@ async def run_all(
       result["enrichment"] = await stage("enrichment", enrich_events(rt, min_usd=enrich_min_usd, max_events=max_enrich_events))
       result["episodes"] = await stage("episodes", build_all_episodes(rt, entity_config))
       result["classification"] = await stage("classification", classify_all(rt, entity_config))
-      result["market_labels"] = await stage("market_labels", label_all_markets(rt, max_episodes=max_market_episodes))
+      market_rows = rt.storage.fetchall("SELECT episode_id FROM episodes WHERE COALESCE(target_asset_key, primary_asset_key) IS NOT NULL ORDER BY start_ts")
+      if max_market_episodes:
+          market_rows = market_rows[:max_market_episodes]
+      result["market_labels"] = await stage("market_labels", label_all_markets(rt, max_episodes=max_market_episodes, progress=dashboard.callback("market_labels", stage_number, len(market_rows))))
       await stage("live_derivatives", snapshot_live_derivatives(rt.okx, rt.storage))
       run_id, frame = await stage("backtest", asyncio.to_thread(run_backtest, rt.storage, min_n=min_backtest_n))
       result["backtest_run_id"] = run_id

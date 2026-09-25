@@ -16,6 +16,8 @@ dependencies = [
   "numpy>=1.26,<3",
   "pandas>=2.2,<3",
   "scipy>=1.12,<2",
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +26,7 @@ dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
 
 [project.scripts]
 smartwallet = "smartwallet.cli:app"
+smartwallet-web = "smartwallet.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

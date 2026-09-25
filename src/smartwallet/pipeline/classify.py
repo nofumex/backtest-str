@@ -45,18 +45,28 @@ class WalletFeatureIndex:
     def __init__(self, storage: Storage, entity_id: str):
         rows = storage.fetchall("SELECT action_type,chain,cex_id,project_id,usd_value,ts,wallet FROM wallet_events WHERE entity_id=? ORDER BY wallet,ts", (entity_id,))
         self.rows: dict[str, list[dict[str, Any]]] = {}
+        self.times: dict[str, list[int]] = {}
+        self.prefix: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             self.rows.setdefault(row["wallet"], []).append(row)
+        for wallet, values in self.rows.items():
+            self.times[wallet] = [int(r["ts"]) for r in values]
+            running = {"event_count": 0, "gross_usd": 0.0, "action_counts": Counter(), "chain_counts": Counter(), "cex_counts": Counter(), "project_counts": Counter()}
+            prefixes = []
+            for r in values:
+                running = {**running, "event_count": running["event_count"] + 1, "gross_usd": running["gross_usd"] + float(r.get("usd_value") or 0), "action_counts": running["action_counts"].copy(), "chain_counts": running["chain_counts"].copy(), "cex_counts": running["cex_counts"].copy(), "project_counts": running["project_counts"].copy()}
+                running["action_counts"][r["action_type"]] += 1
+                running["chain_counts"][r["chain"]] += 1
+                if r.get("cex_id"): running["cex_counts"][r["cex_id"]] += 1
+                if r.get("project_id"): running["project_counts"][r["project_id"]] += 1
+                prefixes.append(running)
+            self.prefix[wallet] = prefixes
 
     def payload(self, entity_id: str, wallet: str, cutoff_ts: int | None = None) -> dict[str, Any]:
         rows = self.rows.get(wallet, [])
-        if cutoff_ts is not None:
-            rows = rows[:bisect.bisect_left([int(r["ts"]) for r in rows], cutoff_ts)]
-        actions = Counter(r["action_type"] for r in rows)
-        chains = Counter(r["chain"] for r in rows)
-        cex = Counter(r["cex_id"] for r in rows if r.get("cex_id"))
-        projects = Counter(r["project_id"] for r in rows if r.get("project_id"))
-        return {"entity_id": entity_id, "wallet": wallet, "event_count": len(rows), "first_ts": rows[0]["ts"] if rows else None, "last_ts": rows[-1]["ts"] if rows else None, "gross_usd": sum(float(r.get("usd_value") or 0) for r in rows), "action_counts": dict(actions), "chain_counts": dict(chains), "cex_counts": dict(cex), "project_counts": dict(projects)}
+        n = len(rows) if cutoff_ts is None else bisect.bisect_left(self.times.get(wallet, []), cutoff_ts)
+        agg = self.prefix.get(wallet, [])[n - 1] if n else {"event_count": 0, "gross_usd": 0.0, "action_counts": {}, "chain_counts": {}, "cex_counts": {}, "project_counts": {}}
+        return {"entity_id": entity_id, "wallet": wallet, "event_count": agg["event_count"], "first_ts": rows[0]["ts"] if n else None, "last_ts": rows[n - 1]["ts"] if n else None, "gross_usd": agg["gross_usd"], "action_counts": dict(agg["action_counts"]), "chain_counts": dict(agg["chain_counts"]), "cex_counts": dict(agg["cex_counts"]), "project_counts": dict(agg["project_counts"])}
 
 
 async def _bounded_map(items: list[Any], worker, concurrency: int) -> list[Any]:
@@ -124,12 +134,24 @@ async def classify_episodes(
     *,
     force: bool = False,
     concurrency: int = 4,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    limit: int | None = None,
 ) -> int:
     sql = "SELECT * FROM episodes WHERE entity_id=?"
     params: list[Any] = [entity_id]
     if not force:
         sql += " AND intent_label IS NULL"
+    if start_ts is not None:
+        sql += " AND start_ts>=?"
+        params.append(int(start_ts))
+    if end_ts is not None:
+        sql += " AND start_ts<=?"
+        params.append(int(end_ts))
     sql += " ORDER BY start_ts"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
     rows = storage.fetchall(sql, params)
     feature_index = WalletFeatureIndex(storage, entity_id)
 

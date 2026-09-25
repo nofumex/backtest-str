@@ -1,2 +1,3 @@
 [console_scripts]
 smartwallet = smartwallet.cli:app
+smartwallet-web = smartwallet.web:main

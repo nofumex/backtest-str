@@ -97,8 +97,30 @@ def _tx_enrichments(storage: Storage, tx_hash: str | None, chain: str) -> dict[s
     return out
 
 
-def build_episodes(storage: Storage, entity_id: str, gap_seconds: int, max_events: int = 50) -> list[dict[str, Any]]:
-    events = storage.fetchall("SELECT * FROM wallet_events WHERE entity_id=? ORDER BY ts,event_id", (entity_id,))
+def build_episodes(
+    storage: Storage,
+    entity_id: str,
+    gap_seconds: int,
+    max_events: int = 50,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> list[dict[str, Any]]:
+    """Build episodes, optionally for one dirty time window.
+
+    Incremental callers expand the dirty interval by ``gap_seconds`` before calling this
+    function. Existing overlapping episodes are replaced after the new set is prepared.
+    """
+    sql = "SELECT * FROM wallet_events WHERE entity_id=?"
+    params: list[Any] = [entity_id]
+    if start_ts is not None:
+        sql += " AND ts>=?"
+        params.append(int(start_ts))
+    if end_ts is not None:
+        sql += " AND ts<=?"
+        params.append(int(end_ts))
+    sql += " ORDER BY ts,event_id"
+    events = storage.fetchall(sql, params)
     if not events:
         return []
     for e in events:
@@ -195,6 +217,20 @@ def build_episodes(storage: Storage, entity_id: str, gap_seconds: int, max_event
                 },
             },
         }
-        storage.save_episode(episode)
         out.append(episode)
+    if start_ts is not None or end_ts is not None:
+        low = int(start_ts if start_ts is not None else -9_223_372_036_854_775_808)
+        high = int(end_ts if end_ts is not None else 9_223_372_036_854_775_807)
+        with storage.conn() as db:
+            old_ids = [r[0] for r in db.execute(
+                "SELECT episode_id FROM episodes WHERE entity_id=? AND end_ts>=? AND start_ts<=?",
+                (entity_id, low, high),
+            )]
+            if old_ids:
+                marks = ",".join("?" for _ in old_ids)
+                db.execute(f"DELETE FROM market_labels WHERE episode_id IN ({marks})", old_ids)
+                db.execute(f"DELETE FROM episode_market_context WHERE episode_id IN ({marks})", old_ids)
+                db.execute(f"DELETE FROM episodes WHERE episode_id IN ({marks})", old_ids)
+    for episode in out:
+        storage.save_episode(episode)
     return out
