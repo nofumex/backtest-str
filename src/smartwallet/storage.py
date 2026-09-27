@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 class Storage:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.run_id = None
+        self.run_bounds = (0, 2**62)
         settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         settings.raw_dir.mkdir(parents=True, exist_ok=True)
         settings.report_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +236,8 @@ class Storage:
         self._archive_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="raw-writer")
         with self.conn() as db:
             db.executescript(SCHEMA)
+            from .migrations import migrate
+            migrate(db)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(episodes)")}
             if "target_asset_key" not in columns:
                 db.execute("ALTER TABLE episodes ADD COLUMN target_asset_key TEXT")
@@ -353,21 +357,12 @@ class Storage:
         return self.fetchone("SELECT 1 FROM tx_enrichment WHERE tx_hash=? AND chain=? AND source=? LIMIT 1", (tx_hash, chain, source)) is not None
 
     def save_event(self, event: dict[str, Any]) -> None:
-        with self.conn() as db:
-            db.execute(
-                """INSERT OR IGNORE INTO wallet_events(
-                   event_id,entity_id,wallet,chain,tx_hash,event_index,ts,source,action_type,cate_id,cex_id,project_id,
-                   usd_value,primary_token_id,primary_asset_key,evidence_json,raw_json,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    event["event_id"], event["entity_id"], event["wallet"], event["chain"], event.get("tx_hash"),
-                    event.get("event_index"), event["ts"], event["source"], event["action_type"], event.get("cate_id"),
-                    event.get("cex_id"), event.get("project_id"), event.get("usd_value"), event.get("primary_token_id"),
-                    event.get("primary_asset_key"), canonical_json(event.get("evidence", {})), canonical_json(event.get("raw", {})), utc_now_iso(),
-                ),
-            )
+        self.save_events([event])
 
     def save_events(self, events: Iterable[dict[str, Any]]) -> None:
+        events = list(events)
+        if self.run_id:
+            events = [e for e in events if self.run_bounds[0] <= e["ts"] <= self.run_bounds[1]]
         now = utc_now_iso()
         values = [(
             e["event_id"], e["entity_id"], e["wallet"], e["chain"], e.get("tx_hash"), e.get("event_index"),
@@ -383,6 +378,18 @@ class Storage:
                 action_type,cate_id,cex_id,project_id,usd_value,primary_token_id,primary_asset_key,evidence_json,raw_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values,
             )
+
+        with self.conn() as db:
+            from .normalize import asset_key
+            for event in events:
+                for token_id, token in (event.get("evidence", {}).get("tokens") or {}).items():
+                    if isinstance(token, dict):
+                        key = asset_key(event["chain"], token_id)
+                        if key and token.get("symbol"):
+                            db.execute("INSERT INTO assets(asset_key,symbol,name) VALUES(?,?,?) ON CONFLICT(asset_key) DO UPDATE SET symbol=excluded.symbol,name=excluded.name", (key,token["symbol"],token.get("name")))
+        if self.run_id:
+            with self.conn() as db:
+                db.executemany("INSERT OR IGNORE INTO run_events(run_id,event_id) VALUES(?,?)", [(self.run_id,e["event_id"]) for e in events])
 
     def market_price_get(self, timestamp: int, coins: tuple[str, ...]) -> dict[str, Any] | None:
         key = hashlib.sha256(canonical_json([int(timestamp), coins]).encode()).hexdigest()
@@ -428,6 +435,9 @@ class Storage:
                     episode.get("intent_confidence"), episode.get("classified_at"),
                 ),
             )
+
+        with self.conn() as db:
+            db.executemany("INSERT OR IGNORE INTO market_horizons(episode_id,horizon_seconds) VALUES(?,?)", [(episode["episode_id"],h) for h in (300,3600,21600,86400,259200)])
 
     def update_episode_intent(self, episode_id: str, label: str, intent: dict[str, Any], confidence: float) -> None:
         with self.conn() as db:

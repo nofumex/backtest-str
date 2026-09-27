@@ -4,6 +4,8 @@ import asyncio
 import json
 import math
 import os
+import secrets
+import base64
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -68,6 +70,30 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def authenticate(request: Request, call_next):
+    secret = os.getenv("SMARTWALLET_AUTH_TOKEN", "")
+    if not secret:
+        host = request.client.host if request.client else ""
+        if os.getenv("SMARTWALLET_ALLOW_INSECURE_LOCAL") != "1" or os.getenv("NODE_ENV") == "production" or host not in ("127.0.0.1", "::1", "testclient"):
+            return JSONResponse({"detail":"Configure SMARTWALLET_AUTH_TOKEN before exposing the terminal"}, status_code=503)
+    else:
+        value = request.headers.get("authorization", "")
+        supplied = value[7:] if value.startswith("Bearer ") else ""
+        if value.startswith("Basic "):
+            try:
+                supplied = base64.b64decode(value[6:], validate=True).decode().partition(":")[2]
+            except (ValueError, UnicodeError):
+                supplied = ""
+        if not secrets.compare_digest(supplied.encode(), secret.encode()):
+            return JSONResponse({"detail":"Authentication required"}, status_code=401, headers={"WWW-Authenticate":'Basic realm="Smartwallet", charset="UTF-8"'})
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and origin not in (str(request.base_url).rstrip("/"), os.getenv("SMARTWALLET_PUBLIC_ORIGIN", ""), "http://localhost:5173", "http://127.0.0.1:5173"):
+            return JSONResponse({"detail":"Invalid origin"}, status_code=403)
+    return await call_next(request)
+
+
 def _elapsed_seconds(run: dict[str, Any]) -> int:
     if not run.get("started_at"):
         return 0
@@ -90,7 +116,12 @@ def _pattern_payload(row: dict[str, Any]) -> dict[str, Any]:
     row["direction"] = "down" if row["mean_return"] < 0 else "up"
     row["asset_label"] = (row["asset_key"].split(":")[-1].upper()
                           .replace("ETHEREUM", "ETH").replace("BITCOIN", "BTC")
-                          .replace("WRAPPED-ETHER", "ETH").replace("WETH", "ETH").replace("WBTC", "BTC"))
+                          )
+    metadata = db.row("SELECT symbol,name FROM assets WHERE asset_key=?", (row["asset_key"],))
+    if metadata and metadata.get("symbol"):
+        row["asset_label"] = metadata["symbol"]
+        row["asset_name"] = metadata["name"]
+    row["chain"] = row["asset_key"].partition(":")[0]
     row["pattern_label"] = row["pattern"].split(":", 1)[-1].replace(">", " → ")
     return row
 
@@ -99,13 +130,15 @@ def snapshot(run_id: str) -> dict[str, Any]:
     run = db.run(run_id)
     if not run:
         raise HTTPException(404, "Run not found")
+    orchestrator._refresh_counts(run_id)
+    run = db.run(run_id)
     elapsed = _elapsed_seconds(run)
     entities = db.rows("SELECT * FROM run_entities WHERE run_id=? ORDER BY name", (run_id,))
     totals = {key: sum(int(row.get(key) or 0) for row in entities) for key in (
-        "wallets_total", "wallets_processed", "wallets_failed", "events", "episodes", "classified", "market_labels", "usable_observations"
+        "wallets_total", "wallets_processed", "wallets_failed", "wallets_partial", "events", "episodes", "classified", "market_labels", "usable_observations"
     )}
     patterns = [_pattern_payload(row) for row in db.rows(
-        """SELECT * FROM pattern_aggregates WHERE run_id=? ORDER BY
+        """SELECT * FROM pattern_aggregates WHERE run_id=? AND n>=3 AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id) ORDER BY
            CASE maturity WHEN 'ROBUST' THEN 4 WHEN 'ESTABLISHING' THEN 3 WHEN 'PROMISING' THEN 2 ELSE 1 END DESC,
            n DESC,ABS(mean_return) DESC LIMIT 24""", (run_id,)
     )]
@@ -120,7 +153,7 @@ def snapshot(run_id: str) -> dict[str, Any]:
             database_size += wal.stat().st_size
     except OSError:
         database_size = 0
-    return {"run": run, "elapsed_seconds": elapsed, "eta_seconds": _eta(run, elapsed), "totals": totals,
+    return {"run": run, "elapsed_seconds": elapsed, "eta_seconds": speed["eta"]["total"], "totals": totals,
             "entities": entities, "patterns": patterns, "feed": feed, "errors": errors, "queues": queues,
             "speed": speed, "database_size": database_size}
 
@@ -153,7 +186,7 @@ async def create_run(payload: RunCreate):
 @app.get("/api/runs")
 def runs():
     rows = db.rows("""SELECT r.*,
-      (SELECT COALESCE(SUM(events),0) FROM run_entities e WHERE e.run_id=r.run_id) events
+      (SELECT COUNT(*) FROM run_events e WHERE e.run_id=r.run_id) events
       FROM analysis_runs r ORDER BY sequence DESC""")
     for row in rows:
         row["entities"] = json.loads(row.pop("entities_json"))
@@ -229,7 +262,7 @@ def episode_evidence(run_id: str, episode_id: str):
     run = db.run(run_id)
     if not run:
         raise HTTPException(404, "Run not found")
-    episode = db.row("SELECT * FROM episodes WHERE episode_id=?", (episode_id,))
+    episode = db.row("SELECT e.* FROM episodes e JOIN run_episodes r USING(episode_id) WHERE e.episode_id=? AND r.run_id=?", (episode_id,run_id))
     from_ts, to_ts = parse_date(run["from_date"]), parse_date(run["to_date"]) + 86399
     if (not episode or episode["entity_id"] not in run["entities"]
             or not from_ts <= int(episode["start_ts"]) <= to_ts):
@@ -246,26 +279,65 @@ def quality(run_id: str):
     run = db.run(run_id)
     if not run:
         raise HTTPException(404, "Run not found")
+    orchestrator._refresh_counts(run_id)
     entities = db.rows("SELECT * FROM run_entities WHERE run_id=? ORDER BY name", (run_id,))
     metrics = db.row("SELECT * FROM run_metrics WHERE run_id=?", (run_id,)) or {}
-    api_requests = int(metrics.get("api_requests") or 0)
-    api_success_rate = (int(metrics.get("api_success") or 0) / api_requests) if api_requests else None
-    from_ts, to_ts = parse_date(run["from_date"]), parse_date(run["to_date"]) + 86399
     for entity in entities:
-        entity_id = entity["entity_id"]
-        entity["unknown_assets"] = db.row("SELECT COUNT(*) n FROM episodes WHERE entity_id=? AND start_ts BETWEEN ? AND ? AND COALESCE(target_asset_key,primary_asset_key) IS NULL", (entity_id, from_ts, to_ts))["n"]
-        entity["unclassified"] = db.row("SELECT COUNT(*) n FROM episodes WHERE entity_id=? AND start_ts BETWEEN ? AND ? AND intent_label IS NULL", (entity_id, from_ts, to_ts))["n"]
-        entity["missing_market"] = db.row("""SELECT COUNT(*) n FROM episodes e WHERE entity_id=? AND start_ts BETWEEN ? AND ? AND COALESCE(target_asset_key,primary_asset_key) IS NOT NULL AND (SELECT COUNT(*) FROM market_labels m WHERE m.episode_id=e.episode_id)<5""", (entity_id, from_ts, to_ts))["n"]
-        entity["errors"] = db.row("SELECT COUNT(*) n FROM run_errors WHERE run_id=? AND entity_id=?", (run_id, entity_id))["n"]
-        coverage = db.row("SELECT MIN(ts) first_ts,MAX(ts) last_ts FROM wallet_events WHERE entity_id=? AND ts BETWEEN ? AND ?", (entity_id, from_ts, to_ts)) or {}
-        entity["coverage_from"] = coverage.get("first_ts")
-        entity["coverage_to"] = coverage.get("last_ts")
-        entity["unsupported_chains"] = db.row("""SELECT COUNT(*) n FROM run_wallets WHERE run_id=? AND entity_id=?
-          AND address NOT LIKE '0x%' AND COALESCE(chain,'')!='solana'""", (run_id, entity_id))["n"]
-        entity["stale_snapshots"] = db.row("""SELECT COUNT(*) n FROM entity_snapshots WHERE entity_id=?
-          AND julianday(captured_at) < julianday('now','-24 hours')""", (entity_id,))["n"]
-        entity["api_success_rate"] = api_success_rate
-    return {"entities": entities, "api": metrics, "errors": db.rows("SELECT * FROM run_errors WHERE run_id=? ORDER BY id DESC LIMIT 200", (run_id,))}
+        eid = entity["entity_id"]
+        base = " FROM episodes e JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND e.entity_id=?"
+        args = (run_id,eid)
+        entity["unknown_assets"] = db.row("SELECT COUNT(*) n"+base+" AND COALESCE(target_asset_key,primary_asset_key) IS NULL",args)["n"]
+        entity["unclassified"] = db.row("SELECT COUNT(*) n"+base+" AND intent_label IS NULL",args)["n"]
+        horizons = db.row("SELECT SUM(h.state IN ('pending','retryable failure')) pending,SUM(h.state='permanently unavailable') unavailable FROM market_horizons h JOIN run_episodes r USING(episode_id) JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.entity_id=?",args)
+        entity["missing_market"] = horizons["pending"] or 0
+        entity["unavailable_market"] = horizons["unavailable"] or 0
+        wallets = db.row("SELECT SUM(status IN ('running','pending')) processing,SUM(status='partial') partial,SUM(address NOT LIKE '0x%' AND COALESCE(chain,'')!='solana') unsupported FROM run_wallets WHERE run_id=? AND entity_id=?",args)
+        entity.update(wallets)
+        entity["unsupported_chains"] = wallets["unsupported"] or 0
+        entity["stale_snapshots"] = None
+        coverage = db.row("SELECT MIN(ts) first_ts,MAX(ts) last_ts FROM wallet_events e JOIN run_events r USING(event_id) WHERE r.run_id=? AND e.entity_id=?",args)
+        entity.update(coverage_from=coverage["first_ts"],coverage_to=coverage["last_ts"])
+        counts = db.row("SELECT COUNT(*) requests,SUM(state IN ('success','cache')) success,SUM(state='retry') retries,SUM(state='failed') failures FROM request_attempts WHERE run_id=? AND entity_id=?",args)
+        entity.update(counts)
+        entity["api_success_rate"] = counts["success"]/counts["requests"] if counts["requests"] else None
+    return {"entities":entities,"api":metrics,
+        "requests":db.rows("SELECT * FROM request_attempts WHERE run_id=? AND state!='success' ORDER BY id DESC LIMIT 200",(run_id,)),
+        "market_failures":db.rows("SELECT h.* FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND h.reason IS NOT NULL LIMIT 200",(run_id,)),
+        "errors":db.rows("SELECT * FROM run_errors WHERE run_id=? ORDER BY id DESC LIMIT 200",(run_id,))}
+
+
+@app.get("/api/runs/{run_id}/patterns")
+def patterns(run_id: str, min_n: int = 3, max_n: int = 0, entity: str = "", intent: str = "", kind: str = "", horizon: int = 0, search: str = "", sort: str = "best", offset: int = 0, limit: int = 24):
+    where, args = "run_id=? AND n>=? AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id)", [run_id,max(1,min_n)]
+    for column,value in (("entity_id",entity),("intent_label",intent),("horizon_seconds",horizon)):
+        if value:
+            where += f" AND {column}=?"; args.append(value)
+    if max_n:
+        where += " AND n<=?"; args.append(max_n)
+    if kind:
+        where += " AND pattern LIKE ?"; args.append(kind+":%")
+    if search:
+        where += " AND (pattern LIKE ? OR asset_key LIKE ? OR intent_label LIKE ? OR asset_key IN (SELECT asset_key FROM assets WHERE symbol LIKE ? OR name LIKE ?))"; args.extend(["%"+search+"%"]*5)
+    orders = {"sample":"n DESC", "effect":"ABS(mean_return) DESC,n DESC", "hit":"MAX(negative_count,positive_count)*1.0/n DESC,n DESC", "newest":"updated_at DESC"}
+    # Bounded effect, evidence strength and shrinkage by sample size.
+    best = "(n*1.0/(n+20))*(1+MIN(ABS(COALESCE(shrunk_mean,mean_return)),1))*(1+COALESCE(holdout_accuracy,0))*(1+CASE WHEN qvalue<=0.05 THEN 1 ELSE 0 END) DESC,n DESC"
+    order = orders.get(sort,best)
+    total = db.row("SELECT COUNT(*) n FROM pattern_aggregates WHERE "+where,args)["n"]
+    rows = db.rows("SELECT * FROM pattern_aggregates WHERE "+where+" ORDER BY "+order+" LIMIT ? OFFSET ?",[*args,min(100,max(1,limit)),max(0,offset)])
+    return {"total":total,"items":[_pattern_payload(r) for r in rows]}
+
+
+@app.post("/api/runs/{run_id}/analysis/refresh")
+async def refresh_analysis(run_id: str):
+    from .incremental import IncrementalAnalyzer
+    if not db.run(run_id):
+        raise HTTPException(404,"Run not found")
+    if orchestrator.active(run_id):
+        orchestrator.full_refresh_requests.add(run_id)
+        if run_id in orchestrator._wakeups:
+            orchestrator._wakeups[run_id].set()
+        return {"status":"queued"}
+    return await asyncio.to_thread(IncrementalAnalyzer(db).refresh,run_id,expensive=True)
 
 
 frontend = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -277,7 +349,7 @@ if frontend.exists():
     @app.get("/{path:path}")
     def spa(path: str):
         target = frontend / path
-        if path and target.is_file():
+        if path and target.resolve().is_relative_to(frontend.resolve()) and target.is_file():
             return FileResponse(target)
         return FileResponse(frontend / "index.html")
 else:
@@ -288,7 +360,7 @@ else:
 
 def main() -> None:
     import uvicorn
-    uvicorn.run("smartwallet.web:app", host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")), reload=False)
+    uvicorn.run("smartwallet.web:app", host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")), reload=False)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from dataclasses import replace
@@ -19,6 +20,7 @@ from .pipeline.market import DEFAULT_HORIZONS, MarketLabeler
 from .pipeline.wallet_context import snapshot_evm_wallet_context
 from .runtime import Runtime
 from .settings import Settings
+from .http import request_context
 from .webdb import WebDB, now_iso
 
 
@@ -33,6 +35,10 @@ class RunOrchestrator:
         self.db = db
         self.tasks: dict[str, asyncio.Task] = {}
         self.runtime_metrics: dict[str, dict[str, Any]] = {}
+        self._samples = {}
+        self._draining = set()
+        self.full_refresh_requests = set()
+        self.analysis_locks = {}
         self._wakeups: dict[str, asyncio.Event] = {}
 
     def active(self, run_id: str) -> bool:
@@ -42,6 +48,7 @@ class RunOrchestrator:
     def launch(self, run_id: str) -> None:
         if self.active(run_id):
             return
+        self._draining.discard(run_id)
         self._wakeups[run_id] = asyncio.Event()
         self.tasks[run_id] = asyncio.create_task(self._run(run_id), name=f"analysis-{run_id[:8]}")
 
@@ -90,28 +97,52 @@ class RunOrchestrator:
             return
         rt: Runtime | None = None
         processor: asyncio.Task | None = None
+        analytics: asyncio.Task | None = None
+        analytics_stop = asyncio.Event()
         started = time.monotonic()
         try:
             settings = Settings.load()
             requested = run["settings"]
             settings = replace(settings, concurrency=max(1, min(32, int(requested.get("concurrency", settings.concurrency)))))
             rt = Runtime.create(settings)
-            self.runtime_metrics[run_id] = {"started_monotonic": started, "hub": rt.hub.metrics, "llm_completed": 0}
+            rt.storage.run_id = run_id
+            rt.storage.run_bounds = (parse_date(run["from_date"]), parse_date(run["to_date"])+86399)
+            def observe(endpoint, provider, attempt, state, error, next_retry, context):
+                self.db.execute("INSERT INTO request_attempts(run_id,entity_id,wallet,provider,endpoint,attempt,state,error,next_retry) VALUES(?,?,?,?,?,?,?,?,?)", (run_id,*context,provider,endpoint,attempt,state,error,next_retry))
+            rt.hub.observer = observe
+            saved = self.db.row("SELECT * FROM run_metrics WHERE run_id=?", (run_id,)) or {}
+            for key,column in (("requests","api_requests"),("success","api_success"),("cache_hit","cache_hits"),("retry","retries"),("failed","failed")):
+                if column in saved:
+                    rt.hub.metrics[key] = saved[column]
+            self.runtime_metrics[run_id] = {"started_monotonic": started, "hub": rt.hub.metrics, "llm_completed": saved.get("llm_completed",0)}
             self.db.update_run(run_id, status="running", stage="discovery", started_at=run.get("started_at") or now_iso(), error=None)
             await self._discover(rt, run)
+            analytics = asyncio.create_task(self._analysis_loop(run_id,analytics_stop))
             processor = asyncio.create_task(self._processor_loop(rt, run_id), name=f"processor-{run_id[:8]}")
             await self._collect(rt, run)
-            self.db.update_run(run_id, stage="draining", current_work="Finishing classification, labels and statistics", progress=0.94)
-            for _ in range(100):
+            self._draining.add(run_id)
+            self._wakeups[run_id].set()
+            await processor
+            self.db.update_run(run_id, stage="draining", current_work="Finishing classification, labels and statistics")
+            while True:
                 await self._checkpoint(run_id)
                 pending = await self._process_once(rt, run_id, final=True)
                 if pending == 0:
                     break
-            IncrementalAnalyzer(self.db).refresh(run_id, expensive=True)
+                next_due = self.db.row("SELECT MIN(next_retry) due FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND h.state IN ('pending','retryable failure') AND next_retry>?", (run_id,time.time()))
+                await asyncio.sleep(min(30,max(1,(next_due["due"] or time.time())-time.time())))
+            if pending:
+                raise RuntimeError(f"Pipeline still has {pending} pending items; resume required")
+            analytics_stop.set()
+            await analytics
+            async with self.analysis_locks.setdefault(run_id,asyncio.Lock()):
+                await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh, run_id, expensive=True)
             self._refresh_counts(run_id)
             self._persist_metrics(run_id, rt)
+            failures = self.db.row("SELECT COUNT(*) n FROM run_wallets WHERE run_id=? AND status IN ('partial','failed')", (run_id,))["n"]
+            failures += self.db.row("SELECT COUNT(*) n FROM classification_jobs WHERE run_id=? AND attempts>=3 AND error IS NOT NULL", (run_id,))["n"]
             self.db.update_run(run_id, status="completed", desired_status="completed", stage="completed",
-                               current_work="Analysis complete", progress=1.0, finished_at=now_iso())
+                               current_work="Analysis complete" + (f"; {failures} failed/partial items; inspect Data Quality" if failures else ""), progress=1.0, finished_at=now_iso())
         except SafeStop:
             self.db.update_run(run_id, status="stopped", desired_status="stopped", stage="stopped",
                                current_work="Stopped safely", finished_at=now_iso())
@@ -120,6 +151,9 @@ class RunOrchestrator:
             self.db.update_run(run_id, status="failed", desired_status="paused", stage="failed", error=str(exc),
                                current_work="Run failed — inspect errors, then resume")
         finally:
+            analytics_stop.set()
+            if analytics:
+                await asyncio.gather(analytics,return_exceptions=True)
             if processor:
                 processor.cancel()
                 await asyncio.gather(processor, return_exceptions=True)
@@ -133,6 +167,7 @@ class RunOrchestrator:
             await self._checkpoint(run["run_id"])
             self.db.update_run(run["run_id"], current_work=f"Discovering {configured.get(entity_id, entity_id)}",
                                progress=0.02 + 0.05 * index / max(1, len(run["entities"])))
+            request_context.set((entity_id, None))
             try:
                 await discover_entity(rt.arkham, rt.storage, entity_id, configured.get(entity_id, entity_id))
                 await snapshot_entity_context(rt.arkham, rt.storage, entity_id)
@@ -161,40 +196,44 @@ class RunOrchestrator:
 
     async def _collect(self, rt: Runtime, run: dict[str, Any]) -> None:
         run_id = run["run_id"]
-        maximum_pages = run["settings"].get("max_pages")
-        batch_size = max(1, min(rt.settings.concurrency, 8))
-        while True:
-            await self._checkpoint(run_id)
-            rows = self.db.rows(
-                "SELECT * FROM run_wallets WHERE run_id=? AND status IN ('pending','failed') AND attempts<3 ORDER BY attempts,address LIMIT ?",
-                (run_id, batch_size),
-            )
-            if not rows:
-                break
-            entity_progress = self.db.row(
-                """SELECT COUNT(*) total,SUM(status='completed') done FROM run_wallets
-                   WHERE run_id=? AND entity_id=?""", (run_id, rows[0]["entity_id"]),
-            ) or {"total": 0, "done": 0}
-            self.db.update_run(run_id, stage="historical_backfill",
-                               current_work=(f'{rows[0]["entity_id"]} · wallet {(entity_progress.get("done") or 0) + 1}'
-                                             f' / {entity_progress.get("total") or 0} · batch of {len(rows)}'))
-            results = await asyncio.gather(*(self._collect_wallet(rt, run, row, maximum_pages) for row in rows), return_exceptions=True)
-            for row, result in zip(rows, results):
-                if isinstance(result, Exception):
-                    self.db.execute(
-                        "UPDATE run_wallets SET status='failed',attempts=attempts+1,error=?,finished_at=? WHERE run_id=? AND entity_id=? AND address=?",
-                        (str(result)[:2000], now_iso(), run_id, row["entity_id"], row["address"]),
-                    )
-                    self.db.add_error(run_id, "backfill", str(result), entity_id=row["entity_id"], item=row["address"])
-                else:
-                    count = int(result.get("events", result.get("swap_activities", 0)))
-                    self.db.execute(
-                        "UPDATE run_wallets SET status='completed',attempts=attempts+1,events=?,error=NULL,finished_at=? WHERE run_id=? AND entity_id=? AND address=?",
-                        (count, now_iso(), run_id, row["entity_id"], row["address"]),
-                    )
-            self._refresh_counts(run_id)
-            if run_id in self._wakeups:
-                self._wakeups[run_id].set()
+        pending = asyncio.Queue()
+        for row in self.db.rows("SELECT * FROM run_wallets WHERE run_id=? AND status='pending' AND attempts<3 ORDER BY attempts,address", (run_id,)):
+            pending.put_nowait(row)
+        async def worker():
+            while not pending.empty():
+                await self._checkpoint(run_id)
+                try:
+                    row = pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                eid,address = row["entity_id"],row["address"]
+                self.db.update_run(run_id,stage="historical_backfill",current_work=f"{eid}: collecting wallet history")
+                self.db.execute("UPDATE run_wallets SET status='running',attempts=attempts+1,started_at=? WHERE run_id=? AND entity_id=? AND address=?", (now_iso(),run_id,eid,address))
+                status, error = "completed", None
+                try:
+                    result = await asyncio.wait_for(self._collect_wallet(rt,run,row,run["settings"].get("max_pages")), timeout=float(os.getenv("SMARTWALLET_WALLET_TIMEOUT","600")))
+                    if result.get("context_error"):
+                        status,error = "partial",result["context_error"]
+                except Exception as exc:
+                    error = str(exc)[:2000] or "Wallet deadline exceeded"
+                    status = "failed"
+                    self.db.add_error(run_id,"backfill",error,entity_id=eid,item=address,retryable=False)
+                count = self.db.row("SELECT COUNT(*) n FROM run_events r JOIN wallet_events e USING(event_id) WHERE r.run_id=? AND e.entity_id=? AND e.wallet=?", (run_id,eid,address))["n"]
+                if count and status == "failed":
+                    status = "partial"
+                self.db.execute("UPDATE run_wallets SET status=?,events=?,error=?,finished_at=? WHERE run_id=? AND entity_id=? AND address=?", (status,count,error,now_iso(),run_id,eid,address))
+                self._persist_metrics(run_id,rt)
+                self._refresh_counts(run_id)
+                if run_id in self._wakeups:
+                    self._wakeups[run_id].set()
+                pending.task_done()
+        tasks = [asyncio.create_task(worker()) for _ in range(max(1,min(rt.settings.concurrency,8)))]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
 
     async def _collect_wallet(self, rt: Runtime, run: dict[str, Any], row: dict[str, Any], max_pages: int | None) -> dict[str, Any]:
         self.db.execute(
@@ -202,6 +241,13 @@ class RunOrchestrator:
             (now_iso(), run["run_id"], row["entity_id"], row["address"]),
         )
         address = row["address"]
+        request_context.set((row["entity_id"], address))
+        cache_params = (row["entity_id"], address, parse_date(run["from_date"]), parse_date(run["to_date"])+86399, max_pages or 0)
+        if self.db.row("SELECT 1 FROM wallet_collection_cache WHERE entity_id=? AND address=? AND from_ts=? AND to_ts=? AND max_pages=?", cache_params):
+            self.db.execute("INSERT OR IGNORE INTO run_events(run_id,event_id) SELECT ?,event_id FROM wallet_events WHERE entity_id=? AND wallet=? AND ts BETWEEN ? AND ?", (run["run_id"],*cache_params[:4]))
+            rt.hub.metrics["cache_hit"] += 1
+            count = self.db.row("SELECT COUNT(*) n FROM wallet_events WHERE entity_id=? AND wallet=? AND ts BETWEEN ? AND ?", cache_params[:4])["n"]
+            return {"events":count}
         if address.startswith("0x"):
             result = await backfill_evm_wallet(rt.debank, rt.storage, entity_id=row["entity_id"], address=address,
                                                min_timestamp=parse_date(run["from_date"]), max_pages=max_pages)
@@ -209,19 +255,21 @@ class RunOrchestrator:
                 await snapshot_evm_wallet_context(rt.arkham, rt.oklink, rt.gecko, rt.storage,
                                                   entity_id=row["entity_id"], address=address, max_tokens=3)
             except Exception as exc:
+                result["context_error"] = str(exc)[:2000]
                 self.db.add_error(run["run_id"], "wallet_context", str(exc), entity_id=row["entity_id"], item=address)
+            self.db.execute("INSERT OR IGNORE INTO wallet_collection_cache VALUES(?,?,?,?,?)", cache_params)
             return result
         if row.get("chain") == "solana":
             return await collect_solana_wallet(rt.jupiter, rt.storage, entity_id=row["entity_id"], address=address, max_pages=max_pages)
-        return {"events": 0}
+        raise RuntimeError("Unsupported chain: " + str(row.get("chain")))
 
     async def _processor_loop(self, rt: Runtime, run_id: str) -> None:
-        expensive_counter = 0
-        while True:
+        while run_id not in self._draining:
             try:
                 await self._checkpoint(run_id)
-                expensive_counter += 1
-                await self._process_once(rt, run_id, final=expensive_counter % 5 == 0)
+                await self._process_once(rt, run_id, final=False)
+                if run_id in self._draining:
+                    return
                 wakeup = self._wakeups[run_id]
                 wakeup.clear()
                 try:
@@ -242,89 +290,80 @@ class RunOrchestrator:
             return 0
         from_ts = parse_date(run["from_date"])
         to_ts = parse_date(run["to_date"]) + 86399
-        # Only entities with newly inserted event rowids are rebuilt, and only around their dirty time range.
         for entity_id in run["entities"]:
-            watermark = self.db.row(
-                "SELECT value_integer FROM run_watermarks WHERE run_id=? AND stream='events' AND entity_id=?", (run_id, entity_id)
-            )
-            last = int(watermark["value_integer"]) if watermark else 0
-            dirty = rt.storage.fetchone(
-                "SELECT MIN(ts) low,MAX(ts) high,MAX(rowid) max_row FROM wallet_events WHERE entity_id=? AND rowid>? AND ts BETWEEN ? AND ?",
-                (entity_id, last, from_ts, to_ts),
-            )
-            if dirty and dirty.get("max_row"):
-                threshold = float(run["settings"].get("enrichment_threshold", 100000) or 0)
-                candidates = rt.storage.fetchall(
-                    """SELECT e.* FROM wallet_events e WHERE e.entity_id=? AND e.rowid>? AND e.rowid<=?
-                       AND e.tx_hash IS NOT NULL AND COALESCE(e.usd_value,0)>=?
-                       AND NOT EXISTS (SELECT 1 FROM tx_enrichment x WHERE x.tx_hash=e.tx_hash AND x.chain=e.chain)
-                       ORDER BY e.usd_value DESC""",
-                    (entity_id, last, dirty["max_row"], threshold),
-                )
-                if candidates:
-                    semaphore = asyncio.Semaphore(rt.settings.concurrency)
-                    async def enrich_one(event):
-                        async with semaphore:
-                            return await enrich_evm_event(
-                                rt.storage, rt.oklink, rt.arkham, rt.rpc, rt.bridges, event,
-                                bridge_min_usd=rt.settings.bridge_check_min_usd,
-                            )
-                    results = await asyncio.gather(*(
-                        enrich_one(event) for event in candidates
-                    ), return_exceptions=True)
-                    for event, result in zip(candidates, results):
-                        if isinstance(result, Exception):
-                            self.db.add_error(run_id, "enrichment", str(result), entity_id=entity_id, item=event.get("tx_hash"))
-                gap = rt.settings.episode_gap_seconds
-                await asyncio.to_thread(build_episodes, rt.storage, entity_id, gap, rt.settings.max_episode_events,
-                                        start_ts=max(from_ts, int(dirty["low"]) - gap * 2), end_ts=min(to_ts, int(dirty["high"]) + gap * 2))
-                self.db.execute(
-                    """INSERT INTO run_watermarks(run_id,stream,entity_id,value_integer,updated_at) VALUES(?,'events',?,?,?)
-                       ON CONFLICT(run_id,stream,entity_id) DO UPDATE SET value_integer=excluded.value_integer,updated_at=excluded.updated_at""",
-                    (run_id, entity_id, dirty["max_row"], now_iso()),
-                )
+            dirty = self.db.row("SELECT COUNT(*) n FROM run_events r JOIN wallet_events e USING(event_id) WHERE r.run_id=? AND e.entity_id=? AND r.built=0", (run_id,entity_id))
+            if dirty["n"]:
+                request_context.set((entity_id,None))
+                threshold = float(run["settings"].get("enrichment_threshold",100000) or 0)
+                candidates = rt.storage.fetchall("""SELECT e.* FROM wallet_events e JOIN run_events r USING(event_id)
+                    WHERE r.run_id=? AND r.built=0 AND e.entity_id=? AND e.tx_hash IS NOT NULL AND COALESCE(e.usd_value,0)>=?
+                    AND NOT EXISTS(SELECT 1 FROM tx_enrichment x WHERE x.tx_hash=e.tx_hash AND x.chain=e.chain)""", (run_id,entity_id,threshold))
+                semaphore = asyncio.Semaphore(min(8,rt.settings.concurrency))
+                async def enrich(event):
+                    async with semaphore:
+                        try:
+                            await asyncio.wait_for(enrich_evm_event(rt.storage,rt.oklink,rt.arkham,rt.rpc,rt.bridges,event,bridge_min_usd=rt.settings.bridge_check_min_usd),timeout=120)
+                        except Exception as exc:
+                            self.db.add_error(run_id,"enrichment",str(exc) or "Enrichment deadline exceeded",entity_id=entity_id,item=event["tx_hash"],retryable=False)
+                await asyncio.gather(*(enrich(event) for event in candidates))
+                await asyncio.to_thread(build_episodes, rt.storage, entity_id, rt.settings.episode_gap_seconds,
+                    rt.settings.max_episode_events, start_ts=from_ts, end_ts=to_ts, run_id=run_id)
 
         llm_limit = 100 if final else 20
         if not rt.settings.llm_api_key:
             raise RuntimeError("FREE_LLM_API is required before episode classification can continue")
         for entity_id in run["entities"]:
+            request_context.set((entity_id,None))
             llm_concurrency = max(1, min(16, int(run["settings"].get("llm_concurrency", 4))))
             completed = await classify_episodes(rt.storage, rt.llm, entity_id, concurrency=min(llm_concurrency, rt.settings.concurrency),
-                                                start_ts=from_ts, end_ts=to_ts, limit=llm_limit)
+                                                start_ts=from_ts, end_ts=to_ts, limit=llm_limit, run_id=run_id)
             if run_id in self.runtime_metrics:
                 self.runtime_metrics[run_id]["llm_completed"] += completed
 
         episodes = rt.storage.fetchall(
-            """SELECT e.* FROM episodes e WHERE e.entity_id IN ({}) AND e.start_ts BETWEEN ? AND ?
-               AND e.intent_label IS NOT NULL AND COALESCE(e.target_asset_key,e.primary_asset_key) IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM episode_market_context c WHERE c.episode_id=e.episode_id)
-               ORDER BY e.start_ts LIMIT ?""".format(",".join("?" for _ in run["entities"])),
-            [*run["entities"], from_ts, to_ts, 100 if final else 20],
-        )
+            """SELECT e.* FROM episodes e JOIN run_episodes r USING(episode_id) WHERE r.run_id=?
+               AND EXISTS(SELECT 1 FROM market_horizons h WHERE h.episode_id=e.episode_id
+               AND h.state IN ('pending','retryable failure') AND h.next_retry<=?) ORDER BY e.start_ts LIMIT ?""",
+            (run_id,time.time(),100 if final else 20))
         if episodes:
             await MarketLabeler(rt.llama, rt.storage).label_episodes(episodes, DEFAULT_HORIZONS, concurrency=min(8, rt.settings.concurrency))
-        IncrementalAnalyzer(self.db).refresh(run_id, expensive=final)
+        async with self.analysis_locks.setdefault(run_id,asyncio.Lock()):
+            analyzer = IncrementalAnalyzer(self.db)
+            await asyncio.to_thread(analyzer.refresh, run_id)
+            full = run_id in self.full_refresh_requests
+            self.full_refresh_requests.discard(run_id)
+            await asyncio.to_thread(analyzer.refresh_expensive, run_id, dirty_only=not full)
         self._refresh_counts(run_id)
         self._persist_metrics(run_id, rt)
         queues = self.queue_counts(run_id)
         return sum(queues.values())
 
+    async def _analysis_loop(self, run_id: str, stop: asyncio.Event) -> None:
+        """Cheap ingestion is independent of slow classification and price requests."""
+        while not stop.is_set():
+            run = self.db.run(run_id)
+            if run and run["desired_status"] == "running":
+                try:
+                    async with self.analysis_locks.setdefault(run_id,asyncio.Lock()):
+                        await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh,run_id)
+                except Exception as exc:
+                    self.db.add_error(run_id,"analysis",type(exc).__name__)
+            try:
+                await asyncio.wait_for(stop.wait(),timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
     def queue_counts(self, run_id: str) -> dict[str, int]:
         run = self.db.run(run_id)
         if not run:
             return {"episode_builder": 0, "llm_classification": 0, "market_labeling": 0, "analysis": 0}
-        entities = run["entities"]
-        marks = ",".join("?" for _ in entities)
-        from_ts, to_ts = parse_date(run["from_date"]), parse_date(run["to_date"]) + 86399
-        llm = self.db.row(f"SELECT COUNT(*) n FROM episodes WHERE entity_id IN ({marks}) AND start_ts BETWEEN ? AND ? AND intent_label IS NULL", [*entities, from_ts, to_ts])["n"]
-        market = self.db.row(f"""SELECT COUNT(*) n FROM episodes e WHERE entity_id IN ({marks}) AND start_ts BETWEEN ? AND ? AND intent_label IS NOT NULL
-          AND COALESCE(target_asset_key,primary_asset_key) IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM episode_market_context c WHERE c.episode_id=e.episode_id)""", [*entities, from_ts, to_ts])["n"]
-        analysis = self.db.row(f"""SELECT COUNT(*) n FROM episodes e JOIN market_labels m ON m.episode_id=e.episode_id
-          WHERE e.entity_id IN ({marks}) AND e.start_ts BETWEEN ? AND ? AND m.simple_return IS NOT NULL AND NOT EXISTS
-          (SELECT 1 FROM analysis_observations o WHERE o.run_id=? AND o.episode_id=e.episode_id AND o.asset_key=m.asset_key AND o.horizon_seconds=m.horizon_seconds)""",
-          [*entities, from_ts, to_ts, run_id])["n"]
-        return {"episode_builder": 0, "llm_classification": int(llm), "market_labeling": int(market), "analysis": int(analysis)}
+        def count(sql):
+            return int(self.db.row(sql, (run_id,))["n"])
+        return {
+            "episode_builder": count("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=0"),
+            "llm_classification": count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NULL AND NOT EXISTS(SELECT 1 FROM classification_jobs j WHERE j.run_id=r.run_id AND j.episode_id=e.episode_id AND j.attempts>=3)"),
+            "market_labeling": count("SELECT COUNT(*) n FROM run_episodes r JOIN market_horizons h USING(episode_id) WHERE r.run_id=? AND h.state IN ('pending','retryable failure')"),
+            "analysis": count("SELECT COUNT(*) n FROM pattern_aggregates WHERE run_id=? AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id) AND n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10,CAST(CEIL(last_expensive_n*1.2) AS INTEGER)))") + count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) JOIN market_labels m USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NOT NULL AND m.simple_return IS NOT NULL AND NOT EXISTS(SELECT 1 FROM analysis_observations o WHERE o.run_id=r.run_id AND o.episode_id=e.episode_id AND o.asset_key=m.asset_key AND o.horizon_seconds=m.horizon_seconds)")}
 
     def _refresh_counts(self, run_id: str) -> None:
         run = self.db.run(run_id)
@@ -333,19 +372,26 @@ class RunOrchestrator:
         from_ts, to_ts = parse_date(run["from_date"]), parse_date(run["to_date"]) + 86399
         with self.db.connect() as db:
             for entity_id in run["entities"]:
-                wallet = db.execute("SELECT COUNT(*),SUM(status='completed'),SUM(status='failed') FROM run_wallets WHERE run_id=? AND entity_id=?", (run_id, entity_id)).fetchone()
-                events = db.execute("SELECT COUNT(*) FROM wallet_events WHERE entity_id=? AND ts BETWEEN ? AND ?", (entity_id, from_ts, to_ts)).fetchone()[0]
-                episodes = db.execute("SELECT COUNT(*),SUM(intent_label IS NOT NULL) FROM episodes WHERE entity_id=? AND start_ts BETWEEN ? AND ?", (entity_id, from_ts, to_ts)).fetchone()
-                labels = db.execute("SELECT COUNT(*) FROM market_labels m JOIN episodes e ON e.episode_id=m.episode_id WHERE e.entity_id=? AND e.start_ts BETWEEN ? AND ?", (entity_id, from_ts, to_ts)).fetchone()[0]
+                wallet = db.execute("SELECT COUNT(*),SUM(status='completed'),SUM(status='failed'),SUM(status='partial') FROM run_wallets WHERE run_id=? AND entity_id=?", (run_id, entity_id)).fetchone()
+                events = db.execute("SELECT COUNT(*) FROM wallet_events WHERE entity_id=? AND event_id IN (SELECT event_id FROM run_events WHERE run_id=?)", (entity_id, run_id)).fetchone()[0]
+                episodes = db.execute("SELECT COUNT(*),SUM(intent_label IS NOT NULL) FROM episodes WHERE entity_id=? AND episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?)", (entity_id, run_id)).fetchone()
+                labels = db.execute("SELECT COUNT(*) FROM (SELECT m.episode_id,m.asset_key,m.horizon_seconds FROM market_labels m JOIN episodes e ON e.episode_id=m.episode_id WHERE e.entity_id=? AND m.simple_return IS NOT NULL AND e.episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?) GROUP BY m.episode_id,m.asset_key,m.horizon_seconds)", (entity_id, run_id)).fetchone()[0]
                 usable = db.execute("""SELECT COUNT(*) FROM (
-                  SELECT 1 FROM analysis_observations WHERE run_id=? AND entity_id=?
+                  SELECT 1 FROM analysis_observations o WHERE run_id=? AND entity_id=?
+                  AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=o.run_id AND r.episode_id=o.episode_id)
                   GROUP BY episode_id,asset_key,horizon_seconds
                 )""", (run_id, entity_id)).fetchone()[0]
-                db.execute("""UPDATE run_entities SET wallets_total=?,wallets_processed=?,wallets_failed=?,events=?,episodes=?,classified=?,market_labels=?,usable_observations=?,updated_at=? WHERE run_id=? AND entity_id=?""",
-                           (wallet[0] or 0, wallet[1] or 0, wallet[2] or 0, events, episodes[0] or 0, episodes[1] or 0, labels, usable, now_iso(), run_id, entity_id))
-            totals = db.execute("SELECT COALESCE(SUM(wallets_total),0),COALESCE(SUM(wallets_processed+wallets_failed),0) FROM run_entities WHERE run_id=?", (run_id,)).fetchone()
-            progress = 0.08 + 0.82 * (totals[1] / totals[0] if totals[0] else 0)
-            db.execute("UPDATE analysis_runs SET progress=MAX(progress,?),updated_at=? WHERE run_id=?", (min(progress, .9), now_iso(), run_id))
+                db.execute("""UPDATE run_entities SET wallets_total=?,wallets_processed=?,wallets_failed=?,wallets_partial=?,events=?,episodes=?,classified=?,market_labels=?,usable_observations=?,updated_at=? WHERE run_id=? AND entity_id=?""",
+                           (wallet[0] or 0, wallet[1] or 0, wallet[2] or 0, wallet[3] or 0, events, episodes[0] or 0, episodes[1] or 0, labels, usable, now_iso(), run_id, entity_id))
+            totals = db.execute("SELECT COALESCE(SUM(wallets_total),0),COALESCE(SUM(wallets_processed+wallets_failed+wallets_partial),0) FROM run_entities WHERE run_id=?", (run_id,)).fetchone()
+            counts = db.execute("SELECT COALESCE(SUM(events),0),COALESCE(SUM(episodes),0),COALESCE(SUM(classified),0),COALESCE(SUM(usable_observations),0) FROM run_entities WHERE run_id=?",(run_id,)).fetchone()
+            built = db.execute("SELECT COUNT(*) FROM run_events WHERE run_id=? AND built=1",(run_id,)).fetchone()[0]
+            market = db.execute("SELECT COUNT(*),COALESCE(SUM(state IN ('success','permanently unavailable')),0) FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=?",(run_id,)).fetchone()
+            labeled = db.execute("SELECT COUNT(*) FROM market_labels m JOIN run_episodes r USING(episode_id) JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NOT NULL AND m.simple_return IS NOT NULL",(run_id,)).fetchone()[0]
+            collection = min(1,totals[1]/totals[0]) if totals[0] else 0
+            fractions = (built/max(1,counts[0]),counts[2]/max(1,counts[1]),market[1]/max(1,market[0]),counts[3]/max(1,labeled))
+            progress = .05 + .45*collection + .1*sum(min(1,f) for f in fractions)
+            db.execute("UPDATE analysis_runs SET progress=CASE WHEN status='completed' THEN 1 ELSE ? END,updated_at=? WHERE run_id=?",(min(progress,.95),now_iso(),run_id))
 
     def live_metrics(self, run_id: str) -> dict[str, Any]:
         metrics = self.runtime_metrics.get(run_id, {})
@@ -362,11 +408,34 @@ class RunOrchestrator:
             hub = {"requests": saved.get("api_requests", 0), "success": saved.get("api_success", 0),
                    "cache_hit": saved.get("cache_hits", 0), "retry": saved.get("retries", 0), "failed": saved.get("failed", 0)}
             llm_completed = saved.get("llm_completed", 0)
-        processed = self.db.row("SELECT COALESCE(SUM(events),0) events,COALESCE(SUM(status='completed'),0) wallets FROM run_wallets WHERE run_id=?", (run_id,)) or {}
-        return {"api": hub, "events_per_minute": round(60 * processed.get("events", 0) / elapsed, 1),
-                "wallets_per_hour": round(3600 * processed.get("wallets", 0) / elapsed, 1),
-                "api_requests_per_second": round(hub.get("requests", 0) / elapsed, 1),
-                "llm_jobs_per_second": round(llm_completed / elapsed, 2)}
+        totals = self.db.row("SELECT COALESCE(SUM(events),0) events,COALESCE(SUM(episodes),0) episodes,COALESCE(SUM(classified),0) classified,COALESCE(SUM(market_labels),0) labels,COALESCE(SUM(usable_observations),0) analyzed FROM run_entities WHERE run_id=?", (run_id,))
+        totals["built_events"] = self.db.row("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=1",(run_id,))["n"]
+        totals["market_done"] = self.db.row("SELECT COUNT(*) n FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND state IN ('success','permanently unavailable')",(run_id,))["n"]
+        wallets = self.db.row("SELECT COUNT(*) total,SUM(status IN ('completed','partial','failed')) done FROM run_wallets WHERE run_id=?", (run_id,))
+        totals.update(wallets=wallets["done"] or 0, requests=hub.get("requests",0))
+        now = time.monotonic()
+        samples = self._samples.setdefault(run_id, [])
+        if not samples or now-samples[-1][0]>=1:
+            samples.append((now,dict(totals)))
+        while len(samples)>2 and samples[1][0]<now-300:
+            samples.pop(0)
+        baseline = next((x for x in reversed(samples) if x[0]<=now-60),samples[0])
+        span = now-baseline[0]
+        rates = {k:max(0,(v-baseline[1].get(k,0))/span) if span>=1 else 0 for k,v in totals.items()}
+        queues = self.queue_counts(run_id)
+        def eta(n,rate):
+            return 0 if n==0 else int(math.ceil(n/rate)) if rate>0 else None
+        remaining = max(0,wallets["total"]-totals["wallets"])
+        etas = {"collection":eta(remaining,rates["wallets"]),
+            "episode":eta(queues["episode_builder"],rates["built_events"]),
+            "llm":eta(queues["llm_classification"],rates["classified"]),
+            "market":eta(queues["market_labeling"],rates["market_done"]),
+            "analysis":eta(queues["analysis"],rates["analyzed"])}
+        # Conservative sequential drain estimate. Unknown throughput is never shown as a short ETA.
+        etas["total"] = sum(etas.values()) if all(v is not None for v in etas.values()) else None
+        return {"api":hub,"events_per_minute":round(60*rates["events"],1),
+            "wallets_per_hour":round(3600*rates["wallets"],1),"api_requests_per_second":round(rates["requests"],1),
+            "llm_jobs_per_second":round(rates["classified"],3),"eta":etas,"window_seconds":round(span)}
 
     def _persist_metrics(self, run_id: str, rt: Runtime) -> None:
         hub = rt.hub.metrics

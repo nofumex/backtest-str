@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import os
 import time
+from contextvars import ContextVar
+
+request_context = ContextVar("request_context", default=(None, None))
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
@@ -43,6 +47,11 @@ class HubClient:
             transport=transport,
             follow_redirects=True,
         )
+        self.observer = None
+        self._limits = {}
+        self._cooldowns = {}
+        self._rate_locks = {}
+        self._next_start = {}
         self.metrics = {"requests": 0, "success": 0, "cache_hit": 0, "retry": 0, "failed": 0}
 
     async def aclose(self) -> None:
@@ -91,49 +100,58 @@ class HubClient:
             )
         path = self._render_path(spec.run_path, path_params)
 
-        last_exc: Exception | None = None
-        for attempt in range(self.settings.http_retries):
+        return await self._execute(endpoint_key, spec.provider, spec.method, path, query, body, allow_upstream_error)
+
+    async def _execute(self, endpoint, provider, method, path, query=None, body=None, allow_error=False):
+        limit = self._limits.setdefault(provider, asyncio.Semaphore(max(1, min(4, self.settings.concurrency))))
+        attempts = max(1, min(8, self.settings.http_retries))
+        for attempt in range(1, attempts + 1):
+            retryable, status, response = True, None, None
             try:
-                self.metrics["requests"] += 1
-                resp = await self._client.request(spec.method, path, params=query, json=body if spec.method != "GET" else None)
-                if resp.status_code == 429:
-                    self.metrics["retry"] += 1
-                    await asyncio.sleep(self._retry_after(resp, attempt))
-                    continue
-                if 500 <= resp.status_code < 600:
-                    self.metrics["retry"] += 1
-                    await asyncio.sleep(self._retry_after(resp, attempt))
-                    continue
-                resp.raise_for_status()
-                payload = resp.json()
-                if not isinstance(payload, dict):
-                    raise HubError(f"{endpoint_key}: Hub envelope must be an object, got {type(payload).__name__}")
-                hub_status = int(payload.get("status", resp.status_code))
-                if hub_status >= 400 and not allow_upstream_error:
-                    raise HubError(f"{endpoint_key}: upstream status={hub_status}, error={payload.get('error')!r}")
+                async with limit:
+                    lock = self._rate_locks.setdefault(provider, asyncio.Lock())
+                    async with lock:
+                        await asyncio.sleep(max(0, max(self._cooldowns.get(provider,0),self._next_start.get(provider,0))-time.time()))
+                        rps = max(.1,float(os.getenv("SMARTWALLET_PROVIDER_RPS", "4")))
+                        self._next_start[provider] = time.time()+1/rps
+                    self.metrics["requests"] += 1
+                    response = await self._client.request(method, path, params=query, json=body if method != "GET" else None)
+                status = response.status_code
+                if status < 400:
+                    payload = response.json()
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid envelope")
+                    status = int(payload.get("status", status))
+                if status >= 400:
+                    retryable = status in (408, 425, 429) or status >= 500
+                    raise HubError(f"HTTP/upstream {status}")
+                if endpoint.startswith("rpc.") and payload.get("error"):
+                    code = payload["error"].get("code") if isinstance(payload["error"],dict) else None
+                    retryable = code in (-32005,-32002)
+                    raise HubError("RPC error")
                 self.metrics["success"] += 1
-                return HubResponse(endpoint_key, hub_status, payload.get("data"), payload)
-            except (httpx.TimeoutException, httpx.TransportError, json.JSONDecodeError, HubError) as exc:
-                last_exc = exc
-                if attempt + 1 >= self.settings.http_retries:
+                self._record(endpoint, provider, attempt, "success", None, None)
+                return HubResponse(endpoint, status, payload.get("result") if endpoint.startswith("rpc.") else payload.get("data"), payload)
+            except (httpx.TransportError, ValueError, HubError) as exc:
+                # Never persist provider response bodies, URLs or credentials.
+                reason = f"status={status}" if status and status >= 400 else type(exc).__name__
+                exhausted = not retryable or attempt == attempts
+                delay = min(30.0, self._retry_after(response, attempt - 1) if response is not None else 2 ** (attempt - 1)) + random.uniform(.1, 1)
+                next_retry = None if exhausted else time.time() + delay
+                self._record(endpoint, provider, attempt, "failed" if exhausted else "retry", reason, next_retry)
+                if exhausted:
                     self.metrics["failed"] += 1
-                # HubError for non-transient 4xx should not be retried.
-                if isinstance(exc, HubError) and "upstream status=4" in str(exc):
-                    raise
-                if attempt + 1 >= self.settings.http_retries:
-                    break
-                await asyncio.sleep(min(15.0, (2 ** attempt) + random.random()))
-        raise HubError(f"{endpoint_key}: request failed after {self.settings.http_retries} attempts: {last_exc}")
+                    raise HubError(f"{provider}/{endpoint}: {reason}; exhausted after {attempt} attempt(s)") from None
+                self.metrics["retry"] += 1
+                if status == 429:
+                    self._cooldowns[provider] = next_retry
+                await asyncio.sleep(delay)
+
+    def _record(self, endpoint, provider, attempt, state, error, next_retry):
+        if self.observer:
+            self.observer(endpoint, provider, attempt, state, error, next_retry, request_context.get())
 
     async def rpc(self, chain: str, method: str, params: list[Any] | dict[str, Any], request_id: int = 1) -> Any:
-        # /docs/rpc documents POST /rpc/{chain} with standard JSON-RPC 2.0 and one request per HTTP call.
-        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        resp = await self._client.post(f"/rpc/{quote(chain, safe='_-')}", json=payload)
-        if resp.status_code == 429:
-            await asyncio.sleep(self._retry_after(resp, 0))
-            resp = await self._client.post(f"/rpc/{quote(chain, safe='_-')}", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            raise HubError(f"rpc/{chain} {method}: {data['error']}")
-        return data.get("result")
+        payload = {"jsonrpc":"2.0","id":request_id,"method":method,"params":params}
+        response = await self._execute(f"rpc.{chain}.{method}", f"rpc.{chain}", "POST", f"/rpc/{quote(chain,safe='_-')}", body=payload)
+        return response.data

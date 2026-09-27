@@ -16,8 +16,8 @@ def bootstrap_ci(values: np.ndarray, *, samples: int = 2000, seed: int = 42) -> 
     if len(values) == 0:
         return math.nan, math.nan
     rng = np.random.default_rng(seed)
-    draws = rng.choice(values, size=(samples, len(values)), replace=True)
-    med = np.median(draws, axis=1)
+    chunk = max(1,min(128,1_000_000//len(values)))
+    med = np.concatenate([np.median(rng.choice(values,size=(min(chunk,samples-start),len(values)),replace=True),axis=1) for start in range(0,samples,chunk)])
     return float(np.quantile(med, 0.025)), float(np.quantile(med, 0.975))
 
 
@@ -37,16 +37,8 @@ def bh_qvalues(pvalues: list[float]) -> list[float]:
 
 
 def _patterns(evidence_json: str, fallback_motif: str) -> list[str]:
-    try:
-        evidence = json.loads(evidence_json)
-    except Exception:
-        evidence = {}
-    values = evidence.get("patterns") if isinstance(evidence, dict) else None
-    if isinstance(values, list):
-        out = sorted({str(v) for v in values if v})
-        if out:
-            return out
-    return ["FULL:" + fallback_motif]
+    from ..incremental import _patterns as canonical_patterns
+    return canonical_patterns(evidence_json, fallback_motif)
 
 
 def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float = 20.0) -> tuple[str, pd.DataFrame]:
@@ -62,7 +54,8 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
     if not rows:
         return str(uuid.uuid4()), pd.DataFrame()
 
-    raw_df = pd.DataFrame(rows)
+    raw_df = pd.DataFrame(rows).drop_duplicates(subset=["episode_id","asset_key","horizon_seconds"])
+    rows = raw_df.to_dict("records")
     # Priors are computed once per episode, before wallet-scope expansion, so a multi-wallet
     # episode cannot accidentally receive extra prior weight.
     prior_cols = ["entity_id", "intent_label", "horizon_seconds", "asset_key"]
@@ -100,7 +93,7 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
     # Four nested hypotheses: broad entity/action, then intent, pattern, and wallet/asset.
     # The level is explicit so multiple observations do not create accidental duplicate tests.
     group_specs = [
-        ("entity_action", broad_df, ["entity_id", "action", "intent_label", "horizon_seconds", "asset_key"]),
+        ("entity_action", broad_df, ["entity_id", "action", "horizon_seconds", "asset_key"]),
         ("wallet_pattern_intent_asset", wallet_pattern_df, ["entity_id", "scope_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
     ]
     if has_patterns:
@@ -126,7 +119,7 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
         test_acc = float(np.mean(np.sign(test) == direction)) if len(test) else math.nan
         key_map = dict(zip(group_cols, keys))
         key_map.setdefault("scope_id", key_map.get("entity_id"))
-        key_map.setdefault("pattern", "ACTION:any")
+        key_map.setdefault("pattern", key_map.get("action", "ACTION:any"))
         key_map.setdefault("motif", key_map.get("action", "ACTION:any"))
         key_map.setdefault("intent_label", "unknown")
         if "asset_key" not in key_map:

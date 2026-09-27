@@ -45,20 +45,22 @@ async def backfill_evm_wallet(
         positions = await debank.positions(address)
         storage.save_position(entity_id, address.lower(), "evm", "debank.portfolio_project_list", positions)
 
-    for chain in chains:
-        n = 0
-        async for row, dictionaries in debank.iter_history(address, chain, min_timestamp=min_timestamp, page_count=20, max_pages=max_pages):
-            event = normalize_debank_event(entity_id, address, chain, row, dictionaries)
-            if event["ts"] <= 0:
-                continue
-            pending.append(event)
-            n += 1
-            count += 1
-            if len(pending) >= 500:
-                storage.save_events(pending)
-                pending.clear()
-        per_chain[chain] = n
-    storage.save_events(pending)
+    try:
+        for chain in chains:
+            n = 0
+            async for row, dictionaries in debank.iter_history(address, chain, min_timestamp=min_timestamp, page_count=20, max_pages=max_pages):
+                event = normalize_debank_event(entity_id, address, chain, row, dictionaries)
+                if event["ts"] <= 0:
+                    continue
+                pending.append(event)
+                n += 1
+                count += 1
+                if len(pending) >= 500:
+                    storage.save_events(pending)
+                    pending.clear()
+            per_chain[chain] = n
+    finally:
+        storage.save_events(pending)
     return {"entity_id": entity_id, "address": address, "chains": chains, "events": count, "per_chain": per_chain}
 
 

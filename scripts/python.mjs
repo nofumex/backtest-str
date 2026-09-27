@@ -1,24 +1,25 @@
-import { spawn } from "node:child_process";
-
-const candidates = process.platform === "win32"
-  ? [["python", []], ["py", ["-3"]]]
-  : [["python3", []], ["python", []]];
-
-function launch(index) {
-  if (index >= candidates.length) {
-    console.error("Python 3.11+ was not found in PATH.");
-    process.exit(127);
-  }
-  const [command, prefix] = candidates[index];
-  const child = spawn(command, [...prefix, ...process.argv.slice(2)], { stdio: "inherit", env: process.env });
-  child.on("error", error => {
-    if (error.code === "ENOENT") launch(index + 1);
-    else { console.error(error); process.exit(1); }
-  });
-  child.on("exit", (code, signal) => {
-    if (signal) process.kill(process.pid, signal);
-    else process.exit(code ?? 1);
-  });
+import { spawnSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const python = resolve(root, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+const run = (exe,args) => {
+  const result = spawnSync(exe,args,{cwd:root,stdio:"inherit"});
+  if(result.error || result.status !== 0) process.exit(result.status || 1);
+};
+let created = false;
+if (!existsSync(python)) {
+  run(process.platform === "win32" ? "python" : "python3", ["-m","venv",resolve(root,".venv")]);
+  created = true;
 }
-
-launch(0);
+const args = process.argv.slice(2);
+if (created || args[0] === "--setup") {
+  run(python,["-m","pip","install","--upgrade","pip","setuptools","wheel"]);
+  run(python,["-m","pip","install","-e",".[dev]"]);
+}
+if (args[0] === "--setup") process.exit(0);
+const child = spawn(python,args,{cwd:root,stdio:"inherit",env:process.env});
+for (const signal of ["SIGINT","SIGTERM"]) process.on(signal,()=>child.kill(signal));
+child.on("error",()=>process.exit(1));
+child.on("exit",code=>process.exit(code ?? 1));

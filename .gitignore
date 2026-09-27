@@ -11,3 +11,6 @@ data/raw/*
 data/reports/*
 !data/raw/.gitkeep
 !data/reports/.gitkeep
+
+/test-results/
+/playwright-report/

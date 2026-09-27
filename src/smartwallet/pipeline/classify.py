@@ -42,8 +42,13 @@ def wallet_feature_payload(storage: Storage, entity_id: str, wallet: str, cutoff
 
 class WalletFeatureIndex:
     """Preloads wallet events once and computes historical prefixes in memory."""
-    def __init__(self, storage: Storage, entity_id: str):
-        rows = storage.fetchall("SELECT action_type,chain,cex_id,project_id,usd_value,ts,wallet FROM wallet_events WHERE entity_id=? ORDER BY wallet,ts", (entity_id,))
+    def __init__(self, storage: Storage, entity_id: str, run_id: str | None = None):
+        sql = "SELECT action_type,chain,cex_id,project_id,usd_value,ts,wallet FROM wallet_events WHERE entity_id=?"
+        params = [entity_id]
+        if run_id:
+            sql += " AND event_id IN (SELECT event_id FROM run_events WHERE run_id=?)"
+            params.append(run_id)
+        rows = storage.fetchall(sql+" ORDER BY wallet,ts", params)
         self.rows: dict[str, list[dict[str, Any]]] = {}
         self.times: dict[str, list[int]] = {}
         self.prefix: dict[str, list[dict[str, Any]]] = {}
@@ -137,9 +142,13 @@ async def classify_episodes(
     start_ts: int | None = None,
     end_ts: int | None = None,
     limit: int | None = None,
+    run_id: str | None = None,
 ) -> int:
     sql = "SELECT * FROM episodes WHERE entity_id=?"
     params: list[Any] = [entity_id]
+    if run_id:
+        sql += " AND episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?) AND episode_id NOT IN (SELECT episode_id FROM classification_jobs WHERE run_id=? AND attempts>=3)"
+        params.extend([run_id, run_id])
     if not force:
         sql += " AND intent_label IS NULL"
     if start_ts is not None:
@@ -153,7 +162,7 @@ async def classify_episodes(
         sql += " LIMIT ?"
         params.append(int(limit))
     rows = storage.fetchall(sql, params)
-    feature_index = WalletFeatureIndex(storage, entity_id)
+    feature_index = await asyncio.to_thread(WalletFeatureIndex, storage, entity_id, run_id)
 
     async def worker(row):
         evidence = json.loads(row["evidence_json"])
@@ -171,7 +180,17 @@ async def classify_episodes(
             "primary_asset_key": row["primary_asset_key"],
             "pre_event_evidence": evidence,
         }
-        result = await llm.classify_episode(payload)
+        if run_id:
+            with storage.conn() as db:
+                db.execute("INSERT INTO classification_jobs(run_id,episode_id,attempts) VALUES(?,?,1) ON CONFLICT(run_id,episode_id) DO UPDATE SET attempts=attempts+1", (run_id,row["episode_id"]))
+        try:
+            result = await llm.classify_episode(payload)
+        except Exception as exc:
+            if run_id:
+                with storage.conn() as db:
+                    db.execute("UPDATE classification_jobs SET error=? WHERE run_id=? AND episode_id=?", (type(exc).__name__,run_id,row["episode_id"]))
+                    db.execute("INSERT INTO run_errors(run_id,stage,entity_id,item,message,retryable,created_at) VALUES(?,'classification',?,?,?,1,datetime('now'))", (run_id,entity_id,row["episode_id"],type(exc).__name__))
+            raise
         storage.update_episode_intent(row["episode_id"], result["label"], result, result["confidence"])
         return row["episode_id"]
 

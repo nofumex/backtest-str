@@ -41,7 +41,16 @@ def _patterns(evidence_json: str, motif: str) -> list[str]:
         values = payload.get("patterns") or []
     except (ValueError, TypeError):
         values = []
-    return sorted({str(value) for value in values if value}) or ["FULL:" + motif]
+    canonical = set()
+    for value in values or ["FULL:" + motif]:
+        prefix, _, sequence = str(value).partition(":")
+        size = len(sequence.split(">"))
+        if prefix == "FULL" and size <= 3:
+            prefix = {1:"ACTION",2:"BIGRAM",3:"TRIGRAM"}[size]
+        if prefix == "ENDPOINT" and len(motif.split(">")) == 2 and sequence == motif:
+            prefix = "BIGRAM"
+        canonical.add(prefix + ":" + sequence)
+    return sorted(canonical)
 
 
 class IncrementalAnalyzer:
@@ -66,6 +75,7 @@ class IncrementalAnalyzer:
                        m.asset_key,m.horizon_seconds,m.simple_return
                 FROM episodes e JOIN market_labels m ON m.episode_id=e.episode_id
                 WHERE e.entity_id IN ({placeholders}) AND e.start_ts BETWEEN ? AND ?
+                  AND e.episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?)
                   AND e.intent_label IS NOT NULL AND m.simple_return IS NOT NULL
                   AND EXISTS (
                     SELECT 1 WHERE NOT EXISTS (
@@ -75,7 +85,7 @@ class IncrementalAnalyzer:
                     )
                   )
                 ORDER BY e.start_ts LIMIT ?""",
-            [*entities, from_ts, to_ts, run_id, batch_size],
+            [*entities, from_ts, to_ts, run_id, run_id, batch_size],
         )
         inserted = 0
         with self.db.connect() as conn:
@@ -106,6 +116,12 @@ class IncrementalAnalyzer:
             for key in dirty:
                 self._rebuild_cheap(conn, run_id, key)
 
+        if dirty:
+            # New/removed hypotheses change the family even when no p-value is recomputed.
+            with self.db.connect() as conn:
+                family = conn.execute("SELECT pattern_key,COALESCE(sign_pvalue,1.0) FROM pattern_aggregates WHERE run_id=?", (run_id,)).fetchall()
+                qvalues = bh_qvalues([r[1] for r in family])
+                conn.executemany("UPDATE pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?", [(q,run_id,r[0]) for r,q in zip(family,qvalues)])
         if expensive:
             self.refresh_expensive(run_id, dirty_only=False)
         self.db.update_run(run_id, analysis_updated_at=now_iso())
@@ -115,7 +131,7 @@ class IncrementalAnalyzer:
         stale = self.db.rows(
             """SELECT o.observation_key,o.entity_id,o.pattern,o.intent_label,o.asset_key,o.horizon_seconds
                FROM analysis_observations o LEFT JOIN episodes e ON e.episode_id=o.episode_id
-               WHERE o.run_id=? AND e.episode_id IS NULL LIMIT 5000""",
+               WHERE o.run_id=? AND (e.episode_id IS NULL OR NOT EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=o.run_id AND r.episode_id=o.episode_id)) LIMIT 5000""",
             (run_id,),
         )
         dirty = {pattern_key(r["entity_id"], r["pattern"], r["intent_label"], r["asset_key"], r["horizon_seconds"]) for r in stale}
@@ -194,8 +210,8 @@ class IncrementalAnalyzer:
 
     def refresh_expensive(self, run_id: str, *, dirty_only: bool = True) -> int:
         aggregates = self.db.rows(
-            """SELECT * FROM pattern_aggregates WHERE run_id=? AND n>=10
-               AND (?=0 OR n>=MAX(last_expensive_n+10, CAST(last_expensive_n*1.2 AS INTEGER))) ORDER BY n DESC""",
+            """SELECT * FROM pattern_aggregates WHERE run_id=? AND n>0
+               AND (?=0 OR (n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10, CAST(CEIL(last_expensive_n*1.2) AS INTEGER))))) ORDER BY n DESC""",
             (run_id, int(dirty_only)),
         )
         updates: list[dict[str, Any]] = []
@@ -222,16 +238,17 @@ class IncrementalAnalyzer:
             updates.append({**aggregate, "median": float(np.median(arr)), "low": low, "high": high, "p": pvalue,
                             "train_n": len(train), "test_n": len(test), "train_mean": train_mean,
                             "test_mean": test_mean, "accuracy": accuracy})
-        if not updates:
-            return 0
-        qvalues = bh_qvalues([item["p"] for item in updates])
+        family = {r["pattern_key"]: r["sign_pvalue"] if r["sign_pvalue"] is not None else 1.0 for r in self.db.rows("SELECT pattern_key,sign_pvalue FROM pattern_aggregates WHERE run_id=?", (run_id,))}
+        family.update({item["pattern_key"]:item["p"] for item in updates})
+        qmap = dict(zip(family, bh_qvalues(list(family.values()))))
+        qvalues = [qmap[item["pattern_key"]] for item in updates]
         with self.db.connect() as conn:
             for item, qvalue in zip(updates, qvalues):
                 old_maturity = item["maturity"]
                 maturity = maturity_for(n=item["n"], ci_low=item["low"], ci_high=item["high"], qvalue=qvalue,
                                         holdout_accuracy=item["accuracy"], train_mean=item["train_mean"], test_mean=item["test_mean"])
                 prior = conn.execute(
-                    "SELECT AVG(return_value) FROM analysis_observations WHERE run_id=? AND entity_id=? AND intent_label=? AND asset_key=? AND horizon_seconds=?",
+                    "SELECT AVG(return_value) FROM (SELECT DISTINCT episode_id,return_value FROM analysis_observations WHERE run_id=? AND entity_id=? AND intent_label=? AND asset_key=? AND horizon_seconds=?)",
                     (run_id, item["entity_id"], item["intent_label"], item["asset_key"], item["horizon_seconds"]),
                 ).fetchone()[0] or 0.0
                 shrunk = (item["n"] * item["mean_return"] + 20 * prior) / (item["n"] + 20)
@@ -248,4 +265,10 @@ class IncrementalAnalyzer:
                         (run_id, item["pattern_key"], item["entity_id"], "maturity", "Maturity changed",
                          f"{old_maturity} → {maturity}", now_iso()),
                     )
+        with self.db.connect() as conn:
+            conn.executemany("UPDATE pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?", [(q,run_id,key) for key,q in qmap.items()])
+        for row in self.db.rows("SELECT * FROM pattern_aggregates WHERE run_id=?", (run_id,)):
+            train_mean = ((row["mean_return"]*row["n"]-(row["test_mean_return"] or 0)*(row["test_n"] or 0))/row["train_n"]) if row["train_n"] else None
+            maturity = maturity_for(n=row["n"],ci_low=row["ci_low"],ci_high=row["ci_high"],qvalue=row["qvalue"],holdout_accuracy=row["holdout_accuracy"],train_mean=train_mean,test_mean=row["test_mean_return"])
+            self.db.execute("UPDATE pattern_aggregates SET maturity=? WHERE run_id=? AND pattern_key=?", (maturity,run_id,row["pattern_key"]))
         return len(updates)

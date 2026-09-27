@@ -47,6 +47,7 @@ def test_incremental_refresh_is_idempotent(tmp_path: Path):
         "source": "test", "price_start": 100, "price_end": 97, "simple_return": -.03,
         "payload": {},
     })
+    web.execute("INSERT INTO run_episodes VALUES(?,?)", (run_id,"ep-1"))
     analyzer = IncrementalAnalyzer(web)
     first = analyzer.refresh(run_id)
     second = analyzer.refresh(run_id)

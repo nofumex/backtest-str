@@ -184,7 +184,15 @@ class WebDB:
         self.path = Path(path or os.getenv("SMARTWALLET_DB", "data/smartwallet.db"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
+            from .storage import SCHEMA
+            db.executescript(SCHEMA)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(episodes)")}
+            if "target_asset_key" not in columns:
+                db.execute("ALTER TABLE episodes ADD COLUMN target_asset_key TEXT")
+                db.execute("UPDATE episodes SET target_asset_key=primary_asset_key")
             db.executescript(WEB_SCHEMA)
+            from .migrations import migrate
+            migrate(db)
 
     @contextmanager
     def connect(self):
@@ -248,6 +256,7 @@ class WebDB:
 
     def recover_interrupted(self) -> None:
         with self.connect() as db:
+            db.execute("UPDATE run_wallets SET status='failed',error='Interrupted wallet retry budget exhausted',finished_at=datetime('now') WHERE status='running' AND attempts>=3")
             db.execute("UPDATE run_wallets SET status='pending',started_at=NULL WHERE status='running'")
             db.execute(
                 """UPDATE analysis_runs SET status='paused',desired_status='paused',stage='interrupted',

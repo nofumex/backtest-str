@@ -137,6 +137,7 @@ def normalize_debank_event(entity_id: str, wallet: str, chain: str, row: dict[st
             "project": (dictionaries.get("project_dict") or {}).get(row.get("project_id")) if row.get("project_id") else None,
         },
         "primary_leg_direction": best_kind,
+        "tokens": dictionaries.get("token_dict") or {},
     }
 
     return {

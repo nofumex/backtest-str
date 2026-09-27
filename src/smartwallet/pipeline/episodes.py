@@ -73,9 +73,9 @@ def behavior_patterns(rows: list[dict[str, Any]]) -> list[str]:
     for n, prefix in ((2, "BIGRAM"), (3, "TRIGRAM")):
         for i in range(0, max(0, len(tokens) - n + 1)):
             patterns.add(f"{prefix}:" + ">".join(tokens[i:i+n]))
-    if len(tokens) >= 2:
+    if len(tokens) > 2:
         patterns.add(f"ENDPOINT:{tokens[0]}>{tokens[-1]}")
-    if 1 <= len(tokens) <= 6:
+    if 4 <= len(tokens) <= 6:
         patterns.add("FULL:" + ">".join(tokens))
     return sorted(patterns)
 
@@ -105,6 +105,7 @@ def build_episodes(
     *,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    run_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build episodes, optionally for one dirty time window.
 
@@ -113,6 +114,9 @@ def build_episodes(
     """
     sql = "SELECT * FROM wallet_events WHERE entity_id=?"
     params: list[Any] = [entity_id]
+    if run_id:
+        sql += " AND event_id IN (SELECT event_id FROM run_events WHERE run_id=?)"
+        params.append(run_id)
     if start_ts is not None:
         sql += " AND ts>=?"
         params.append(int(start_ts))
@@ -218,19 +222,16 @@ def build_episodes(
             },
         }
         out.append(episode)
-    if start_ts is not None or end_ts is not None:
-        low = int(start_ts if start_ts is not None else -9_223_372_036_854_775_808)
-        high = int(end_ts if end_ts is not None else 9_223_372_036_854_775_807)
+    if run_id:
         with storage.conn() as db:
-            old_ids = [r[0] for r in db.execute(
-                "SELECT episode_id FROM episodes WHERE entity_id=? AND end_ts>=? AND start_ts<=?",
-                (entity_id, low, high),
-            )]
-            if old_ids:
-                marks = ",".join("?" for _ in old_ids)
-                db.execute(f"DELETE FROM market_labels WHERE episode_id IN ({marks})", old_ids)
-                db.execute(f"DELETE FROM episode_market_context WHERE episode_id IN ({marks})", old_ids)
-                db.execute(f"DELETE FROM episodes WHERE episode_id IN ({marks})", old_ids)
+            db.execute("DELETE FROM run_episodes WHERE run_id=? AND episode_id IN (SELECT episode_id FROM episodes WHERE entity_id=?)", (run_id, entity_id))
     for episode in out:
         storage.save_episode(episode)
+        if run_id:
+            with storage.conn() as db:
+                db.execute("INSERT OR IGNORE INTO run_episodes VALUES(?,?)", (run_id, episode["episode_id"]))
+                db.executemany("INSERT OR IGNORE INTO market_horizons(episode_id,horizon_seconds) VALUES(?,?)", [(episode["episode_id"], h) for h in (300,3600,21600,86400,259200)])
+    if run_id:
+        with storage.conn() as db:
+            db.execute("UPDATE run_events SET built=1 WHERE run_id=? AND event_id IN (SELECT event_id FROM wallet_events WHERE entity_id=?)", (run_id, entity_id))
     return out

@@ -8,6 +8,7 @@ src/smartwallet/contracts.py
 src/smartwallet/http.py
 src/smartwallet/incremental.py
 src/smartwallet/llm.py
+src/smartwallet/migrations.py
 src/smartwallet/normalize.py
 src/smartwallet/orchestrator.py
 src/smartwallet/progress.py
@@ -48,11 +49,13 @@ tests/test_backtest.py
 tests/test_contracts.py
 tests/test_debank_pagination.py
 tests/test_episodes.py
+tests/test_incremental_terminal.py
 tests/test_llm.py
 tests/test_llm_resilience.py
 tests/test_market.py
 tests/test_no_direct_hub_routes.py
 tests/test_normalize.py
 tests/test_patterns.py
+tests/test_production_regressions.py
 tests/test_provider_registry.py
 tests/test_wallet_context.py

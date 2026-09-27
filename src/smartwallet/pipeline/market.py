@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import time
 import asyncio
 from statistics import pstdev
 from typing import Any
 
 from ..providers import DefiLlamaProvider, OKXMarketProvider
 from ..storage import Storage
+from ..http import request_context
 
 
 DEFAULT_HORIZONS = (300, 3600, 21600, 86400, 259200)
@@ -86,6 +88,7 @@ class MarketLabeler:
     async def label_episodes(self, episodes: list[dict[str, Any]], horizons: tuple[int, ...] = DEFAULT_HORIZONS, concurrency: int = 8, progress=None) -> dict[str, int]:
         sem = asyncio.Semaphore(max(1, concurrency))
         async def one(ep):
+            request_context.set((ep["entity_id"],None))
             async with sem:
                 try:
                     n = await self.label_episode(ep, horizons)
@@ -120,41 +123,48 @@ class MarketLabeler:
 
     async def label_episode(self, episode: dict[str, Any], horizons: tuple[int, ...] = DEFAULT_HORIZONS) -> int:
         asset = episode.get("target_asset_key") or episode.get("primary_asset_key")
-        if not asset:
-            return 0
-        await self.save_pre_event_context(episode)
-        coins = [asset, BTC, ETH]
-        start = int(episode["start_ts"])
-        p0_payload = await self.prices(start, coins)
-        p0 = extract_price(p0_payload, asset)
-        btc0 = extract_price(p0_payload, BTC)
-        eth0 = extract_price(p0_payload, ETH)
-        n = 0
-        endpoints = await asyncio.gather(*(self.prices(start + horizon, coins) for horizon in horizons))
-        for horizon, end_payload in zip(horizons, endpoints):
-            p1 = extract_price(end_payload, asset)
-            btc1 = extract_price(end_payload, BTC)
-            eth1 = extract_price(end_payload, ETH)
-            asset_r = ret(p0, p1)
-            btc_r = ret(btc0, btc1)
-            eth_r = ret(eth0, eth1)
-            row = {
-                "episode_id": episode["episode_id"],
-                "asset_key": asset,
-                "horizon_seconds": horizon,
-                "source": "defillama.historical_price",
-                "price_start": p0,
-                "price_end": p1,
-                "simple_return": asset_r,
-                "btc_return": btc_r,
-                "eth_return": eth_r,
-                "excess_vs_btc": asset_r - btc_r if asset_r is not None and btc_r is not None else None,
-                "excess_vs_eth": asset_r - eth_r if asset_r is not None and eth_r is not None else None,
-                "payload": {"start": p0_payload, "end": end_payload},
-            }
-            if asset_r is not None:
-                self.storage.save_market_label(row)
-                n += 1
+        eid, start, n = episode["episode_id"], int(episode["start_ts"]), 0
+        with self.storage.conn() as db:
+            db.executemany("INSERT OR IGNORE INTO market_horizons(episode_id,horizon_seconds) VALUES(?,?)", [(eid,h) for h in horizons])
+        for horizon in horizons:
+            state = self.storage.fetchone("SELECT * FROM market_horizons WHERE episode_id=? AND horizon_seconds=?", (eid,horizon))
+            if state["state"] in ("success", "permanently unavailable") or state["next_retry"] > time.time():
+                continue
+            cached = self.storage.fetchone("SELECT 1 FROM market_labels WHERE episode_id=? AND asset_key=? AND horizon_seconds=? AND simple_return IS NOT NULL", (eid,asset,horizon))
+            reason, next_retry, attempts = None, 0, state["attempts"]
+            if cached:
+                status = "success"
+            elif not asset:
+                status, reason = "permanently unavailable", "unknown asset"
+            elif start + horizon > time.time():
+                status, reason, next_retry = "pending", "horizon has not matured", start + horizon
+            else:
+                attempts += 1
+                try:
+                    coins = [asset, BTC, ETH]
+                    p0, p1 = await asyncio.gather(self.prices(start, coins), self.prices(start+horizon, coins))
+                    r = ret(extract_price(p0,asset), extract_price(p1,asset))
+                    if r is None:
+                        status, reason = "permanently unavailable", "provider has no historical price"
+                    else:
+                        br, er = ret(extract_price(p0,BTC),extract_price(p1,BTC)), ret(extract_price(p0,ETH),extract_price(p1,ETH))
+                        self.storage.save_market_label(dict(episode_id=eid,asset_key=asset,horizon_seconds=horizon,source="defillama.historical_price",price_start=extract_price(p0,asset),price_end=extract_price(p1,asset),simple_return=r,btc_return=br,eth_return=er,excess_vs_btc=r-br if br is not None else None,excess_vs_eth=r-er if er is not None else None,payload={"start":p0,"end":p1}))
+                        status, n = "success", n+1
+                except Exception as exc:
+                    reason = str(exc)[:250]
+                    status = "permanently unavailable" if attempts >= 3 else "retryable failure"
+                    if attempts >= 3:
+                        reason = "retry budget exhausted: " + reason
+                    else:
+                        next_retry = time.time() + min(60, 2**attempts)
+            with self.storage.conn() as db:
+                db.execute("UPDATE market_horizons SET state=?,reason=?,attempts=?,next_retry=? WHERE episode_id=? AND horizon_seconds=?", (status,reason,attempts,next_retry,eid,horizon))
+        # Context is independent of horizon completeness.
+        if not self.storage.fetchone("SELECT 1 FROM episode_market_context WHERE episode_id=?", (eid,)):
+            try:
+                await self.save_pre_event_context(episode)
+            except Exception:
+                pass
         return n
 
 
