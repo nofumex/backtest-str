@@ -185,6 +185,20 @@ CREATE TABLE IF NOT EXISTS market_price_cache (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS market_time_series (
+    asset_key TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    bucket INTEGER NOT NULL,
+    price REAL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    resolution INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'success',
+    reason TEXT,
+    PRIMARY KEY(asset_key, timestamp, resolution, source)
+);
+CREATE INDEX IF NOT EXISTS idx_market_series_lookup ON market_time_series(asset_key,timestamp,status);
+
 CREATE TABLE IF NOT EXISTS market_snapshots (
     captured_at TEXT NOT NULL,
     source TEXT NOT NULL,

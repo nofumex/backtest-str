@@ -74,6 +74,8 @@ CONTRACTS: dict[str, EndpointContract] = {
     # DefiLlama
     "defillama.chains": _c("defillama.chains", "defillama", "/coins/chains", (), "https://hub.arbitron.dev/providers/defillama/endpoint?method=GET&path=%2Fcoins%2Fchains"),
     "defillama.historical_price": _c("defillama.historical_price", "defillama", "/coins/prices/historical/{timestamp}/{coins}", (), "https://hub.arbitron.dev/providers/defillama/endpoint?method=GET&path=%2Fcoins%2Fprices%2Fhistorical%2F%7Btimestamp%7D%2F%7Bcoins%7D"),
+    "defillama.batch_historical": _c("defillama.batch_historical", "defillama", "/coins/batchHistorical", ("coins", "searchWidth"), "https://hub.arbitron.dev/providers/defillama/endpoint?method=GET&path=%2Fcoins%2FbatchHistorical"),
+    "defillama.price_chart": _c("defillama.price_chart", "defillama", "/coins/chart/{coins}", ("start", "end", "span", "period", "searchWidth"), "https://hub.arbitron.dev/providers/defillama/endpoint?method=GET&path=%2Fcoins%2Fchart%2F%7Bcoins%7D"),
 
     # Bridge evidence
     "lifi.status": _c("lifi.status", "lifi", "/pipeline/v1/status", ("txHash",), "https://hub.arbitron.dev/providers/lifi/endpoint?method=GET&path=%2Fpipeline%2Fv1%2Fstatus"),

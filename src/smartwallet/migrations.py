@@ -9,6 +9,8 @@ CREATE INDEX IF NOT EXISTS idx_request_run ON request_attempts(run_id,entity_id)
 CREATE TABLE IF NOT EXISTS wallet_collection_cache(entity_id TEXT,address TEXT,from_ts INTEGER,to_ts INTEGER,max_pages INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(entity_id,address,from_ts,to_ts,max_pages));
 CREATE TABLE IF NOT EXISTS classification_jobs(run_id TEXT,episode_id TEXT,attempts INTEGER DEFAULT 0,error TEXT,PRIMARY KEY(run_id,episode_id));
 CREATE TABLE IF NOT EXISTS assets(asset_key TEXT PRIMARY KEY,symbol TEXT,name TEXT);
+CREATE TABLE IF NOT EXISTS market_time_series(asset_key TEXT NOT NULL,timestamp INTEGER NOT NULL,bucket INTEGER NOT NULL,price REAL,source TEXT NOT NULL,fetched_at TEXT NOT NULL,resolution INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'success',reason TEXT,PRIMARY KEY(asset_key,timestamp,resolution,source));
+CREATE INDEX IF NOT EXISTS idx_market_series_lookup ON market_time_series(asset_key,timestamp,status);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);
 """
 
@@ -36,4 +38,14 @@ def migrate(db):
             db.execute("ALTER TABLE run_metrics ADD COLUMN deterministic_completed INTEGER NOT NULL DEFAULT 0")
         if "classification_seconds" not in columns:
             db.execute("ALTER TABLE run_metrics ADD COLUMN classification_seconds REAL NOT NULL DEFAULT 0")
+        for name, definition in (
+            ("market_cache_hits", "INTEGER NOT NULL DEFAULT 0"),
+            ("market_fetched_points", "INTEGER NOT NULL DEFAULT 0"),
+            ("market_unavailable_points", "INTEGER NOT NULL DEFAULT 0"),
+            ("market_external_calls", "INTEGER NOT NULL DEFAULT 0"),
+            ("market_horizons_processed", "INTEGER NOT NULL DEFAULT 0"),
+            ("market_seconds", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                db.execute(f"ALTER TABLE run_metrics ADD COLUMN {name} {definition}")
         db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(4)")

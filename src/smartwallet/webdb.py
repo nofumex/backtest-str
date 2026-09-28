@@ -103,6 +103,12 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     llm_completed INTEGER NOT NULL DEFAULT 0,
     deterministic_completed INTEGER NOT NULL DEFAULT 0,
     classification_seconds REAL NOT NULL DEFAULT 0,
+    market_cache_hits INTEGER NOT NULL DEFAULT 0,
+    market_fetched_points INTEGER NOT NULL DEFAULT 0,
+    market_unavailable_points INTEGER NOT NULL DEFAULT 0,
+    market_external_calls INTEGER NOT NULL DEFAULT 0,
+    market_horizons_processed INTEGER NOT NULL DEFAULT 0,
+    market_seconds REAL NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 

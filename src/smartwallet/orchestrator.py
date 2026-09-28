@@ -119,6 +119,12 @@ class RunOrchestrator:
                 "hub": rt.hub.metrics,
                 "classification_completed": saved.get("deterministic_completed", saved.get("llm_completed", 0)),
                 "classification_seconds": saved.get("classification_seconds", 0.0),
+                "market_cache_hits": saved.get("market_cache_hits", 0),
+                "market_fetched_points": saved.get("market_fetched_points", 0),
+                "market_unavailable_points": saved.get("market_unavailable_points", 0),
+                "market_external_calls": saved.get("market_external_calls", 0),
+                "market_horizons_processed": saved.get("market_horizons_processed", 0),
+                "market_seconds": saved.get("market_seconds", 0.0),
             }
             self.db.update_run(run_id, status="running", stage="discovery", started_at=run.get("started_at") or now_iso(), error=None)
             await self._discover(rt, run)
@@ -326,10 +332,17 @@ class RunOrchestrator:
         episodes = rt.storage.fetchall(
             """SELECT e.* FROM episodes e JOIN run_episodes r USING(episode_id) WHERE r.run_id=?
                AND EXISTS(SELECT 1 FROM market_horizons h WHERE h.episode_id=e.episode_id
-               AND h.state IN ('pending','retryable failure') AND h.next_retry<=?) ORDER BY e.start_ts LIMIT ?""",
-            (run_id,time.time(),100 if final else 20))
+               AND h.state IN ('pending','retryable failure') AND h.next_retry<=?) ORDER BY e.start_ts""",
+            (run_id,time.time()))
         if episodes:
-            await MarketLabeler(rt.llama, rt.storage).label_episodes(episodes, DEFAULT_HORIZONS, concurrency=min(8, rt.settings.concurrency))
+            market_result = await MarketLabeler(rt.llama, rt.storage).label_episodes(
+                episodes, DEFAULT_HORIZONS, concurrency=min(8, rt.settings.concurrency),
+            )
+            runtime = self.runtime_metrics.get(run_id)
+            if runtime is not None:
+                for key in ("cache_hits", "fetched_points", "unavailable_points", "external_calls", "horizons_processed"):
+                    runtime[f"market_{key}"] += market_result.get(key, 0)
+                runtime["market_seconds"] += market_result.get("elapsed_seconds", 0.0)
         async with self.analysis_locks.setdefault(run_id,asyncio.Lock()):
             analyzer = IncrementalAnalyzer(self.db)
             await asyncio.to_thread(analyzer.refresh, run_id)
@@ -414,6 +427,8 @@ class RunOrchestrator:
             hub = dict(metrics.get("hub") or {})
             classification_completed = metrics.get("classification_completed", 0)
             classification_seconds = metrics.get("classification_seconds", 0.0)
+            market = {key: metrics.get(f"market_{key}", 0) for key in
+                      ("cache_hits", "fetched_points", "unavailable_points", "external_calls", "horizons_processed", "seconds")}
         else:
             started = datetime.fromisoformat(run["started_at"]) if run.get("started_at") else datetime.now(timezone.utc)
             ended = datetime.fromisoformat(run["finished_at"]) if run.get("finished_at") else datetime.now(timezone.utc)
@@ -423,6 +438,8 @@ class RunOrchestrator:
                    "cache_hit": saved.get("cache_hits", 0), "retry": saved.get("retries", 0), "failed": saved.get("failed", 0)}
             classification_completed = saved.get("deterministic_completed", saved.get("llm_completed", 0))
             classification_seconds = saved.get("classification_seconds", 0.0)
+            market = {key: saved.get(f"market_{key}", 0) for key in
+                      ("cache_hits", "fetched_points", "unavailable_points", "external_calls", "horizons_processed", "seconds")}
         totals = self.db.row("SELECT COALESCE(SUM(events),0) events,COALESCE(SUM(episodes),0) episodes,COALESCE(SUM(classified),0) classified,COALESCE(SUM(market_labels),0) labels,COALESCE(SUM(usable_observations),0) analyzed FROM run_entities WHERE run_id=?", (run_id,))
         totals["built_events"] = self.db.row("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=1",(run_id,))["n"]
         totals["market_done"] = self.db.row("SELECT COUNT(*) n FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND state IN ('success','permanently unavailable')",(run_id,))["n"]
@@ -443,11 +460,12 @@ class RunOrchestrator:
         remaining = max(0,wallets["total"]-totals["wallets"])
         classification_queue = queues.get("intent_classification", queues.get("llm_classification", 0))
         classification_rate = (classification_completed / classification_seconds) if classification_seconds > 0 else rates["classified"]
+        market_rate = (market["horizons_processed"] / market["seconds"]) if market["seconds"] > 0 else rates["market_done"]
         classification_eta = eta(classification_queue, classification_rate)
         etas = {"collection":eta(remaining,rates["wallets"]),
             "episode":eta(queues["episode_builder"],rates["built_events"]),
             "classification":classification_eta,
-            "market":eta(queues["market_labeling"],rates["market_done"]),
+            "market":eta(queues["market_labeling"],market_rate),
             "analysis":eta(queues["analysis"],rates["analyzed"])}
         # Compatibility for callers supplying the legacy queue contract.
         if "llm_classification" in queues and "intent_classification" not in queues:
@@ -456,19 +474,29 @@ class RunOrchestrator:
         etas["total"] = sum(etas.values()) if all(v is not None for v in etas.values()) else None
         return {"api":hub,"events_per_minute":round(60*rates["events"],1),
             "wallets_per_hour":round(3600*rates["wallets"],1),"api_requests_per_second":round(rates["requests"],1),
-            "intent_episodes_per_second":round(classification_rate,1),"eta":etas,"window_seconds":round(span)}
+            "intent_episodes_per_second":round(classification_rate,1),
+            "market_horizons_per_second":round(market_rate,1),"market":market,
+            "eta":etas,"window_seconds":round(span)}
 
     def _persist_metrics(self, run_id: str, rt: Runtime) -> None:
         hub = rt.hub.metrics
         classification_completed = self.runtime_metrics.get(run_id, {}).get("classification_completed", 0)
         classification_seconds = self.runtime_metrics.get(run_id, {}).get("classification_seconds", 0.0)
+        runtime = self.runtime_metrics.get(run_id, {})
         self.db.execute(
             """INSERT INTO run_metrics(run_id,api_requests,api_success,cache_hits,retries,failed,llm_completed,
-               deterministic_completed,classification_seconds,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET api_requests=excluded.api_requests,
+               deterministic_completed,classification_seconds,market_cache_hits,market_fetched_points,
+               market_unavailable_points,market_external_calls,market_horizons_processed,market_seconds,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET api_requests=excluded.api_requests,
                api_success=excluded.api_success,cache_hits=excluded.cache_hits,retries=excluded.retries,
                failed=excluded.failed,deterministic_completed=excluded.deterministic_completed,
-               classification_seconds=excluded.classification_seconds,updated_at=excluded.updated_at""",
+               classification_seconds=excluded.classification_seconds,market_cache_hits=excluded.market_cache_hits,
+               market_fetched_points=excluded.market_fetched_points,market_unavailable_points=excluded.market_unavailable_points,
+               market_external_calls=excluded.market_external_calls,market_horizons_processed=excluded.market_horizons_processed,
+               market_seconds=excluded.market_seconds,updated_at=excluded.updated_at""",
             (run_id, hub.get("requests", 0), hub.get("success", 0), hub.get("cache_hit", 0), hub.get("retry", 0),
-             hub.get("failed", 0), 0, classification_completed, classification_seconds, now_iso()),
+             hub.get("failed", 0), 0, classification_completed, classification_seconds,
+             runtime.get("market_cache_hits", 0), runtime.get("market_fetched_points", 0),
+             runtime.get("market_unavailable_points", 0), runtime.get("market_external_calls", 0),
+             runtime.get("market_horizons_processed", 0), runtime.get("market_seconds", 0.0), now_iso()),
         )
