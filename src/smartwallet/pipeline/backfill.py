@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
@@ -42,6 +43,7 @@ async def backfill_evm_wallet(
     max_timestamp = int(max_timestamp or storage.run_bounds[1])
     count = 0
     per_chain: dict[str, int] = {}
+    chain_errors: dict[str, str] = {}
     queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=max(1, min(64, len(chains) + 1)))
 
     async def collect_chain(chain: str) -> tuple[str, int]:
@@ -124,8 +126,20 @@ async def backfill_evm_wallet(
             try:
                 if chain is None:
                     return
-                key, value = await collect_chain(chain)
-                per_chain[key] = value
+                try:
+                    key, value = await collect_chain(chain)
+                    per_chain[key] = value
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    chain_errors[chain] = f"{type(exc).__name__}: {exc}"[:500]
+                    with suppress(Exception):
+                        with storage.conn() as db:
+                            db.execute(
+                                """UPDATE wallet_history_coverage SET state='failed',updated_at=?
+                                   WHERE entity_id=? AND address=? AND chain=?""",
+                                (utc_now_iso(), entity_id, address.lower(), chain),
+                            )
             finally:
                 queue.task_done()
 
@@ -135,10 +149,22 @@ async def backfill_evm_wallet(
         await queue.put(chain)
     for _ in workers:
         await queue.put(None)
-    await queue.join()
-    await asyncio.gather(*workers)
+    try:
+        await queue.join()
+        await asyncio.gather(*workers)
+    finally:
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
     count = sum(per_chain.values())
-    return {"entity_id": entity_id, "address": address, "chains": chains, "events": count, "per_chain": per_chain}
+    return {
+        "entity_id": entity_id, "address": address, "chains": chains, "events": count,
+        "per_chain": per_chain, "chain_errors": chain_errors,
+        "context_error": (f"{len(chain_errors)}/{len(chains)} chain backfills failed: "
+                          + "; ".join(f"{chain}: {error}" for chain, error in sorted(chain_errors.items())))
+                         if chain_errors else None,
+    }
 
 
 async def collect_solana_wallet(jupiter: JupiterProvider, storage: Storage, *, entity_id: str, address: str, max_pages: int | None = None) -> dict[str, Any]:

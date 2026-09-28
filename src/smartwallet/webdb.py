@@ -258,7 +258,17 @@ CREATE INDEX IF NOT EXISTS idx_feed_run ON discovery_feed(run_id, id DESC);
 
 class WebDB:
     def __init__(self, path: Path | str | None = None):
-        self.path = Path(path or os.getenv("SMARTWALLET_DB", "data/smartwallet.db"))
+        from .settings import project_path
+        configured = path if path is not None else os.getenv("SMARTWALLET_DB")
+        self.path = project_path(configured, "data/smartwallet.db")
+        existed = self.path.exists()
+        if (not existed and os.getenv("NODE_ENV") == "production"
+                and os.getenv("SMARTWALLET_ALLOW_NEW_DB") != "1"):
+            raise RuntimeError(
+                f"Refusing to create a new production database at {self.path}. "
+                "Set SMARTWALLET_DB to the existing absolute database path, or explicitly set "
+                "SMARTWALLET_ALLOW_NEW_DB=1 for an intentional first deployment."
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             from .storage import SCHEMA
@@ -270,6 +280,11 @@ class WebDB:
             db.executescript(WEB_SCHEMA)
             from .migrations import migrate
             migrate(db)
+
+    def startup_info(self) -> dict[str, Any]:
+        size = self.path.stat().st_size if self.path.exists() else 0
+        runs = self.row("SELECT COUNT(*) n FROM analysis_runs")
+        return {"path": str(self.path), "size": size, "analysis_runs": int((runs or {"n": 0})["n"])}
 
     @contextmanager
     def connect(self):

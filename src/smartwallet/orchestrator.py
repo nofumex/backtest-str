@@ -289,7 +289,8 @@ class RunOrchestrator:
                    VALUES(?,'wallet_context',?,?,?,0,?)""",
                 (run["run_id"], address.lower(), row["entity_id"], json.dumps({"address": address}), now_iso()),
             )
-            self.db.execute("INSERT OR IGNORE INTO wallet_collection_cache VALUES(?,?,?,?,?)", cache_params)
+            if not result.get("chain_errors"):
+                self.db.execute("INSERT OR IGNORE INTO wallet_collection_cache VALUES(?,?,?,?,?)", cache_params)
             self.db.execute(
                 """INSERT OR IGNORE INTO run_events(run_id,event_id)
                    SELECT ?,event_id FROM wallet_events WHERE entity_id=? AND wallet=? AND ts BETWEEN ? AND ?""",
@@ -388,21 +389,50 @@ class RunOrchestrator:
         return int(result.get("observations", 0)) + int(result.get("primary_observations", 0))
 
     async def _enrich_once(self, rt: Runtime, run_id: str) -> int:
+        concurrency = max(1, min(
+            int(os.getenv("SMARTWALLET_ENRICHMENT_CONCURRENCY", str(rt.settings.concurrency))), 8,
+        ))
+        jobs = self._claim_enrichment_jobs(run_id, min(64, concurrency * 4))
+        if not jobs:
+            return self._flush_enrichment_invalidations(run_id)
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def one(job: dict[str, Any]) -> None:
+            async with semaphore:
+                await self._process_enrichment_job(rt, run_id, job)
+
+        results = await asyncio.gather(*(one(job) for job in jobs), return_exceptions=True)
+        for job, result in zip(jobs, results):
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                self.db.execute(
+                    """UPDATE deferred_jobs SET state='retryable',error=?,next_retry=?,updated_at=?
+                       WHERE run_id=? AND kind=? AND item_key=? AND state='running'""",
+                    (f"{type(result).__name__}: {result}"[:500], time.time() + 5, now_iso(),
+                     run_id, job["kind"], job["item_key"]),
+                )
+        self._flush_enrichment_invalidations(run_id)
+        return len(jobs)
+
+    def _claim_enrichment_jobs(self, run_id: str, limit: int) -> list[dict[str, Any]]:
         with self.db.connect() as db:
-            row = db.execute(
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
                 """SELECT * FROM deferred_jobs WHERE run_id=? AND state IN ('pending','retryable')
-                   AND next_retry<=? ORDER BY priority DESC,updated_at LIMIT 1""", (run_id, time.time()),
-            ).fetchone()
-            if not row:
-                return 0
-            claimed = db.execute(
-                """UPDATE deferred_jobs SET state='running',attempts=attempts+1,updated_at=?
-                   WHERE run_id=? AND kind=? AND item_key=? AND state IN ('pending','retryable')""",
-                (now_iso(), run_id, row["kind"], row["item_key"]),
-            ).rowcount
-        if not claimed:
-            return 0
-        job = dict(row)
+                   AND next_retry<=? ORDER BY priority DESC,updated_at LIMIT ?""",
+                (run_id, time.time(), max(1, limit)),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            stamp = now_iso()
+            for row in rows:
+                if db.execute(
+                    """UPDATE deferred_jobs SET state='running',attempts=attempts+1,updated_at=?
+                       WHERE run_id=? AND kind=? AND item_key=? AND state IN ('pending','retryable')""",
+                    (stamp, run_id, row["kind"], row["item_key"]),
+                ).rowcount:
+                    claimed.append(dict(row))
+            return claimed
+
+    async def _process_enrichment_job(self, rt: Runtime, run_id: str, job: dict[str, Any]) -> None:
         try:
             payload = json.loads(job["payload_json"] or "{}")
             if job["kind"] == "wallet_context":
@@ -413,26 +443,33 @@ class RunOrchestrator:
                                              "debank.portfolio_project_list", positions)
                 await snapshot_evm_wallet_context(rt.arkham, rt.oklink, rt.gecko, rt.storage,
                                                   entity_id=job["entity_id"], address=address, max_tokens=3)
-                # Historical wallet context is classification evidence. Rebuild only this
-                # wallet's run events; episode evidence hashing then invalidates secondary data.
-                self.db.execute(
-                    """UPDATE run_events SET built=0 WHERE run_id=? AND event_id IN
-                       (SELECT event_id FROM wallet_events WHERE entity_id=? AND wallet=?)""",
-                    (run_id, job["entity_id"], address),
-                )
             elif job["kind"] == "tx_enrichment":
                 event = rt.storage.fetchone("SELECT * FROM wallet_events WHERE event_id=?", (payload["event_id"],))
                 if event:
                     await enrich_evm_event(rt.storage, rt.oklink, rt.arkham, rt.rpc, rt.bridges, event,
                                            bridge_min_usd=rt.settings.bridge_check_min_usd)
-                    with self.db.connect() as db:
-                        db.execute(
-                            """UPDATE run_events SET built=0 WHERE run_id=? AND event_id IN
-                               (SELECT event_id FROM wallet_events WHERE tx_hash=? AND chain=?)""",
-                            (run_id, event["tx_hash"], event["chain"]),
-                        )
-            self.db.execute("UPDATE deferred_jobs SET state='complete',error=NULL,updated_at=? WHERE run_id=? AND kind=? AND item_key=?",
-                            (now_iso(), run_id, job["kind"], job["item_key"]))
+            else:
+                raise ValueError(f"Unsupported enrichment job kind: {job['kind']}")
+            with self.db.connect() as db:
+                db.execute(
+                    """UPDATE deferred_jobs SET state='complete',error=NULL,updated_at=?
+                       WHERE run_id=? AND kind=? AND item_key=?""",
+                    (now_iso(), run_id, job["kind"], job["item_key"]),
+                )
+                if job["kind"] == "wallet_context":
+                    db.execute(
+                        """INSERT OR IGNORE INTO enrichment_invalidations(run_id,event_id,created_at)
+                           SELECT ?,e.event_id,? FROM wallet_events e JOIN run_events r ON r.event_id=e.event_id
+                           WHERE r.run_id=? AND e.entity_id=? AND e.wallet=?""",
+                        (run_id, now_iso(), run_id, job["entity_id"], address),
+                    )
+                elif event:
+                    db.execute(
+                        """INSERT OR IGNORE INTO enrichment_invalidations(run_id,event_id,created_at)
+                           SELECT ?,e.event_id,? FROM wallet_events e JOIN run_events r ON r.event_id=e.event_id
+                           WHERE r.run_id=? AND e.tx_hash=? AND e.chain=?""",
+                        (run_id, now_iso(), run_id, event["tx_hash"], event["chain"]),
+                    )
         except Exception as exc:
             attempts = int(job["attempts"]) + 1
             state = "failed" if attempts >= 3 else "retryable"
@@ -445,13 +482,32 @@ class RunOrchestrator:
             if state == "failed":
                 self.db.add_error(run_id, "enrichment", str(exc), entity_id=job.get("entity_id"),
                                   item=f"{job['kind']}:{job['item_key']}", retryable=False)
-        return 1
+
+    def _flush_enrichment_invalidations(self, run_id: str) -> int:
+        with self.db.connect() as db:
+            pending = db.execute(
+                """SELECT COUNT(*) FROM deferred_jobs
+                   WHERE run_id=? AND state NOT IN ('complete','failed')""", (run_id,),
+            ).fetchone()[0]
+            if pending:
+                return 0
+            count = int(db.execute(
+                "SELECT COUNT(*) FROM enrichment_invalidations WHERE run_id=?", (run_id,),
+            ).fetchone()[0])
+            if count:
+                db.execute(
+                    """UPDATE run_events SET built=0 WHERE run_id=? AND event_id IN
+                       (SELECT event_id FROM enrichment_invalidations WHERE run_id=?)""", (run_id, run_id),
+                )
+                db.execute("DELETE FROM enrichment_invalidations WHERE run_id=?", (run_id,))
+            return count
 
     def _core_pending(self, run_id: str) -> int:
         now = time.time()
         queries = (
             ("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=0", (run_id,)),
             ("SELECT COUNT(*) n FROM deferred_jobs WHERE run_id=? AND state NOT IN ('complete','failed')", (run_id,)),
+            ("SELECT COUNT(*) n FROM enrichment_invalidations WHERE run_id=?", (run_id,)),
             ("""SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id)
                 WHERE r.run_id=? AND e.intent_label IS NULL""", (run_id,)),
             ("""SELECT COUNT(*) n FROM run_episodes r JOIN market_horizons h USING(episode_id)

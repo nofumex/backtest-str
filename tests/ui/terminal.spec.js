@@ -34,3 +34,17 @@ test('sample filter and pagination parameters',async({page})=>{
  const url=new URL((await request).url());expect(url.searchParams.get('min_n')).toBe('1');
  expect(url.searchParams.get('limit')).toBe('24');
 });
+test('runs archive distinguishes API failure from an empty archive',async({page})=>{
+ await page.unroute('**/api/**');let attempts=0;
+ await page.route('**/api/runs',async route=>{
+  attempts++;
+  if(attempts===1)return route.fulfill({status:503,json:{detail:'Database temporarily unavailable'}});
+  return route.fulfill({json:[{...run,events:12,elapsed_seconds:3}]});
+ });
+ await page.goto('/runs');
+ await expect(page.getByText('Could not load analysis runs.')).toBeVisible();
+ await expect(page.getByText('Database temporarily unavailable')).toBeVisible();
+ await expect(page.getByText('No analysis runs yet')).toHaveCount(0);
+ await page.getByRole('button',{name:'Retry'}).click();
+ await expect(page.getByText('12 events')).toBeVisible();
+});

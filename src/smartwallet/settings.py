@@ -7,6 +7,17 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def project_path(value: str | Path | None, default: str) -> Path:
+    """Resolve runtime paths independently of the process working directory."""
+    path = Path(value) if value not in (None, "") else PROJECT_ROOT / default
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
 @dataclass(frozen=True)
 class Settings:
     hub_base_url: str
@@ -41,9 +52,9 @@ class Settings:
             llm_api_key=os.getenv("FREE_LLM_API", "").strip(),
             llm_base_url=os.getenv("FREE_LLM_BASE_URL", "http://159.194.241.69:3001/v1").rstrip("/"),
             llm_model=os.getenv("FREE_LLM_MODEL", "llama-3.3-70b-versatile").strip(),
-            db_path=Path(os.getenv("SMARTWALLET_DB", "data/smartwallet.db")),
-            raw_dir=Path(os.getenv("SMARTWALLET_RAW_DIR", "data/raw")),
-            report_dir=Path(os.getenv("SMARTWALLET_REPORT_DIR", "data/reports")),
+            db_path=project_path(os.getenv("SMARTWALLET_DB"), "data/smartwallet.db"),
+            raw_dir=project_path(os.getenv("SMARTWALLET_RAW_DIR"), "data/raw"),
+            report_dir=project_path(os.getenv("SMARTWALLET_REPORT_DIR"), "data/reports"),
             http_timeout=float(os.getenv("SMARTWALLET_HTTP_TIMEOUT", "60")),
             http_retries=max(1, int(os.getenv("SMARTWALLET_HTTP_RETRIES", "4"))),
             concurrency=max(1, int(os.getenv("SMARTWALLET_CONCURRENCY", "8"))),

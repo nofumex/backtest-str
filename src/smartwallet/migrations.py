@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS deferred_jobs(run_id TEXT NOT NULL,kind TEXT NOT NULL
 CREATE INDEX IF NOT EXISTS idx_deferred_jobs_queue ON deferred_jobs(run_id,kind,state,next_retry,priority);
 CREATE TABLE IF NOT EXISTS artifact_provenance(artifact_type TEXT NOT NULL,artifact_id TEXT NOT NULL,version TEXT NOT NULL,input_hash TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(artifact_type,artifact_id));
 CREATE TABLE IF NOT EXISTS analysis_invalidations(run_id TEXT NOT NULL,layer TEXT NOT NULL,pattern_key TEXT NOT NULL,PRIMARY KEY(run_id,layer,pattern_key));
+CREATE TABLE IF NOT EXISTS enrichment_invalidations(run_id TEXT NOT NULL,event_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(run_id,event_id));
 INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);
 """
 
@@ -67,3 +68,4 @@ def migrate(db):
     db.execute("CREATE INDEX IF NOT EXISTS idx_run_events_built ON run_events(run_id,built,event_id)")
     db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(6)")
     db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(7)")
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(8)")

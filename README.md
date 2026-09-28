@@ -90,6 +90,8 @@ Default paths:
 - legacy CLI reports: `data/reports/`
 
 Useful environment overrides include `SMARTWALLET_DB`, `SMARTWALLET_RAW_DIR`, `SMARTWALLET_REPORT_DIR`, `SMARTWALLET_CONCURRENCY`, `SMARTWALLET_HTTP_TIMEOUT` and `PORT`.
+Relative runtime paths are resolved from the repository root, never the process working directory.
+Production refuses to create a missing database unless `SMARTWALLET_ALLOW_NEW_DB=1` is set explicitly for an intentional first deployment.
 
 Run automated checks with:
 

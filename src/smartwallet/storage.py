@@ -245,6 +245,13 @@ CREATE TABLE IF NOT EXISTS analysis_invalidations (
     PRIMARY KEY(run_id,layer,pattern_key)
 );
 
+CREATE TABLE IF NOT EXISTS enrichment_invalidations (
+    run_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(run_id,event_id)
+);
+
 CREATE TABLE IF NOT EXISTS market_snapshots (
     captured_at TEXT NOT NULL,
     source TEXT NOT NULL,

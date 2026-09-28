@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import logging
 import secrets
 import base64
 from contextlib import asynccontextmanager
@@ -22,6 +23,9 @@ from .config import load_entities
 from .orchestrator import RunOrchestrator
 from .pipeline.backfill import parse_date
 from .webdb import WebDB
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class RunSettings(BaseModel):
@@ -52,6 +56,12 @@ orchestrator = RunOrchestrator(db)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    info = db.startup_info()
+    logger.info("Smartwallet database path=%s size_bytes=%s analysis_runs=%s",
+                info["path"], info["size"], info["analysis_runs"])
+    if not info["analysis_runs"]:
+        logger.warning("Smartwallet database is empty: path=%s size_bytes=%s. Verify SMARTWALLET_DB if runs were expected.",
+                       info["path"], info["size"])
     db.recover_interrupted()
     yield
     for task in orchestrator.tasks.values():

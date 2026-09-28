@@ -9,6 +9,7 @@ from smartwallet.webdb import WebDB
 from smartwallet.orchestrator import RunOrchestrator
 from smartwallet.incremental import IncrementalAnalyzer, _patterns
 from smartwallet.pipeline.market import MarketLabeler, DEFAULT_HORIZONS
+from smartwallet.pipeline.backfill import backfill_evm_wallet
 
 
 def create(db):
@@ -17,6 +18,88 @@ def create(db):
 
 def episode(storage, eid="e"):
     storage.save_episode(dict(episode_id=eid,entity_id="x",start_ts=1735689600,end_ts=1735689600,wallets=["0xa"],event_ids=["event"],motif="BUY",primary_asset_key="ethereum:0xtoken",evidence={"patterns":["FULL:BUY","ACTION:BUY"]},intent_label="buy"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", [{"arb"}, {"arb", "op"}])
+async def test_evm_chain_failure_cannot_deadlock_wallet(settings, broken):
+    storage = Storage(settings)
+    class Debank:
+        async def used_chains(self, address):
+            return ["eth", "arb", "op"]
+        async def history_page(self, address, chain, **kwargs):
+            if chain in broken:
+                raise RuntimeError(f"{chain} unavailable")
+            return {"history_list": []}
+    result = await asyncio.wait_for(
+        backfill_evm_wallet(Debank(), storage, entity_id="x", address="0xa",
+                            min_timestamp=1, max_timestamp=100),
+        timeout=1,
+    )
+    assert set(result["chain_errors"]) == broken
+    assert result["context_error"] and "chain backfills failed" in result["context_error"]
+    assert set(result["per_chain"]) == {"eth", "arb", "op"} - broken
+    assert storage.fetchone(
+        "SELECT COUNT(*) n FROM wallet_history_coverage WHERE state='failed'"
+    )["n"] == len(broken)
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_enrichment_is_bounded_concurrent_and_invalidations_are_coalesced(settings, monkeypatch):
+    cfg = replace(settings, concurrency=2)
+    storage = Storage(cfg); db = WebDB(cfg.db_path); rid = create(db)
+    event = dict(event_id="enrich-event", entity_id="x", wallet="0xa", chain="eth",
+                 tx_hash="0xtx", event_index=0, ts=1735689600, source="test",
+                 action_type="TRANSFER_OUT", usd_value=200000, primary_token_id="eth",
+                 primary_asset_key="coingecko:ethereum", evidence={}, raw={})
+    storage.save_event(event)
+    db.execute("INSERT INTO run_events(run_id,event_id,built) VALUES(?,?,1)", (rid, event["event_id"]))
+    for index in range(10):
+        db.execute(
+            """INSERT INTO deferred_jobs(run_id,kind,item_key,entity_id,payload_json,updated_at)
+               VALUES(?,'tx_enrichment',?,'x',?,datetime('now'))""",
+            (rid, f"job-{index}", '{"event_id":"enrich-event"}'),
+        )
+    active = maximum = 0
+    async def enrich(*args, **kwargs):
+        nonlocal active, maximum
+        active += 1; maximum = max(maximum, active)
+        await asyncio.sleep(.01)
+        active -= 1
+    monkeypatch.setattr("smartwallet.orchestrator.enrich_evm_event", enrich)
+    rt = SimpleNamespace(settings=cfg, storage=storage, oklink=None, arkham=None, rpc=None, bridges=None)
+    worker = RunOrchestrator(db)
+    assert await worker._enrich_once(rt, rid) == 8
+    assert maximum == 2
+    assert db.row("SELECT built FROM run_events WHERE run_id=?", (rid,))["built"] == 1
+    assert db.row("SELECT COUNT(*) n FROM enrichment_invalidations WHERE run_id=?", (rid,))["n"] == 1
+    assert await worker._enrich_once(rt, rid) == 2
+    assert db.row("SELECT built FROM run_events WHERE run_id=?", (rid,))["built"] == 0
+    assert db.row("SELECT COUNT(*) n FROM enrichment_invalidations WHERE run_id=?", (rid,))["n"] == 0
+    assert db.row("SELECT COUNT(*) n FROM deferred_jobs WHERE state='complete'", ())["n"] == 10
+    storage.close()
+
+
+def test_runtime_paths_are_project_relative_and_production_db_is_fail_fast(tmp_path, monkeypatch):
+    from smartwallet.settings import PROJECT_ROOT, project_path
+    monkeypatch.chdir(tmp_path)
+    assert project_path(None, "data/smartwallet.db") == (PROJECT_ROOT / "data/smartwallet.db").resolve()
+    monkeypatch.setenv("NODE_ENV", "production")
+    monkeypatch.delenv("SMARTWALLET_ALLOW_NEW_DB", raising=False)
+    with pytest.raises(RuntimeError, match="Refusing to create a new production database"):
+        WebDB(tmp_path / "missing" / "smartwallet.db")
+
+
+def test_additive_upgrade_preserves_run_archive_membership(settings):
+    db = WebDB(settings.db_path); rid = create(db)
+    with db.connect() as conn:
+        conn.execute("INSERT INTO wallet_events(event_id,entity_id,wallet,chain,ts,source,action_type,evidence_json,raw_json,created_at) VALUES('old-event','x','0xa','eth',1,'old','TRANSFER','{}','{}',datetime('now'))")
+        conn.execute("INSERT INTO run_events(run_id,event_id,built) VALUES(?,?,1)", (rid, "old-event"))
+    WebDB(settings.db_path)
+    assert db.row("SELECT COUNT(*) n FROM analysis_runs")["n"] == 1
+    assert db.row("SELECT COUNT(*) n FROM run_entities WHERE run_id=?", (rid,))["n"] == 1
+    assert db.row("SELECT COUNT(*) n FROM run_events WHERE run_id=?", (rid,))["n"] == 1
 
 
 @pytest.mark.asyncio

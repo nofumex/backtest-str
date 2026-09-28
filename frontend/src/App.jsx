@@ -151,8 +151,15 @@ function RunDashboard({runId}) {
 }
 
 function Runs() {
- const [runs,setRuns]=useState([]);useEffect(()=>{request("/runs").then(setRuns)},[]);
- return <section><div className="pageHead"><div><div className="eyebrow">RESEARCH ARCHIVE</div><h1>Analysis runs</h1></div><button className="primary" onClick={()=>go("/")}>+ New analysis</button></div><div className="runsList">{runs.map(run=><button key={run.run_id} onClick={()=>go(`/runs/${run.run_id}`)}><span className={`runNumber ${run.status}`}>#{run.sequence}</span><div><b>{run.status.toUpperCase()}</b><span>{run.from_date} → {run.to_date} · {run.entities.length} entities</span></div><div><b>{number(run.events)} events</b><span>{duration(run.elapsed_seconds)}</span></div><em>→</em></button>)}</div></section>;
+ const [runs,setRuns]=useState(null),[loading,setLoading]=useState(true),[error,setError]=useState("");
+ const load=()=>{setLoading(true);setError("");request("/runs").then(setRuns).catch(e=>setError(e.message)).finally(()=>setLoading(false))};
+ useEffect(load,[]);
+ return <section><div className="pageHead"><div><div className="eyebrow">RESEARCH ARCHIVE</div><h1>Analysis runs</h1></div><button className="primary" onClick={()=>go("/")}>+ New analysis</button></div>
+  {loading&&runs===null&&<div className="loading">Loading analysis archive…</div>}
+  {!loading&&error&&<div className="errorBox"><b>Could not load analysis runs.</b><div>{error}</div><button className="primary small" onClick={load}>Retry</button></div>}
+  {!loading&&!error&&runs?.length===0&&<div className="emptyState"><i>0</i><b>No analysis runs yet</b><span>The API returned an empty archive.</span></div>}
+  {runs?.length>0&&<div className="runsList">{runs.map(run=><button key={run.run_id} onClick={()=>go(`/runs/${run.run_id}`)}><span className={`runNumber ${run.status}`}>#{run.sequence}</span><div><b>{run.status.toUpperCase()}</b><span>{run.from_date} → {run.to_date} · {run.entities.length} entities</span></div><div><b>{number(run.events)} events</b><span>{duration(run.elapsed_seconds)}</span></div><em>→</em></button>)}</div>}
+ </section>;
 }
 
 function Quality({runId}) {
