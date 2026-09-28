@@ -15,7 +15,7 @@ from .pipeline.backfill import backfill_evm_wallet, collect_solana_wallet, parse
 from .pipeline.classify import classify_episodes
 from .pipeline.discovery import discover_entity, snapshot_entity_context
 from .pipeline.enrich import enrich_evm_event
-from .pipeline.episodes import build_episodes
+from .pipeline.episodes import build_episodes, dirty_windows
 from .pipeline.market import DEFAULT_HORIZONS, MarketLabeler
 from .pipeline.wallet_context import snapshot_evm_wallet_context
 from .runtime import Runtime
@@ -57,7 +57,7 @@ class RunOrchestrator:
         if not run:
             raise KeyError(run_id)
         if action == "pause":
-            self.db.update_run(run_id, desired_status="paused", status="pausing")
+            self.db.update_run(run_id, desired_status="paused", status="pausing" if self.active(run_id) else "paused")
         elif action == "resume":
             other = self.db.row(
                 "SELECT run_id FROM analysis_runs WHERE run_id!=? AND status IN ('running','queued','pausing','paused','stopping') LIMIT 1",
@@ -68,7 +68,8 @@ class RunOrchestrator:
             self.db.update_run(run_id, desired_status="running", status="queued", error=None)
             self.launch(run_id)
         elif action == "stop":
-            self.db.update_run(run_id, desired_status="stopped", status="stopping")
+            self.db.update_run(run_id, desired_status="stopped", status="stopping" if self.active(run_id) else "stopped",
+                               finished_at=None if self.active(run_id) else now_iso())
         else:
             raise ValueError(action)
         if run_id in self._wakeups:
@@ -96,9 +97,8 @@ class RunOrchestrator:
         if not run:
             return
         rt: Runtime | None = None
-        processor: asyncio.Task | None = None
-        analytics: asyncio.Task | None = None
-        analytics_stop = asyncio.Event()
+        stage_tasks: list[asyncio.Task] = []
+        stages_stop = asyncio.Event()
         started = time.monotonic()
         try:
             settings = Settings.load()
@@ -128,24 +128,21 @@ class RunOrchestrator:
             }
             self.db.update_run(run_id, status="running", stage="discovery", started_at=run.get("started_at") or now_iso(), error=None)
             await self._discover(rt, run)
-            analytics = asyncio.create_task(self._analysis_loop(run_id,analytics_stop))
-            processor = asyncio.create_task(self._processor_loop(rt, run_id), name=f"processor-{run_id[:8]}")
+            stage_tasks = [asyncio.create_task(self._stage_loop(rt, run_id, stage, stages_stop),
+                                               name=f"{stage}-{run_id[:8]}")
+                           for stage in ("episodes", "classification", "market", "analysis", "enrichment")]
             await self._collect(rt, run)
             self._draining.add(run_id)
             self._wakeups[run_id].set()
-            await processor
-            self.db.update_run(run_id, stage="draining", current_work="Finishing deterministic classification, labels and statistics")
-            while True:
+            self.db.update_run(run_id, stage="draining", current_work="Draining concurrent core queues")
+            stable = 0
+            while stable < 2:
                 await self._checkpoint(run_id)
-                pending = await self._process_once(rt, run_id, final=True)
-                if pending == 0:
-                    break
-                next_due = self.db.row("SELECT MIN(next_retry) due FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND h.state IN ('pending','retryable failure') AND next_retry>?", (run_id,time.time()))
-                await asyncio.sleep(min(30,max(1,(next_due["due"] or time.time())-time.time())))
-            if pending:
-                raise RuntimeError(f"Pipeline still has {pending} pending items; resume required")
-            analytics_stop.set()
-            await analytics
+                pending = self._core_pending(run_id)
+                stable = stable + 1 if pending == 0 else 0
+                await asyncio.sleep(0.25)
+            stages_stop.set()
+            await asyncio.gather(*stage_tasks, return_exceptions=False)
             async with self.analysis_locks.setdefault(run_id,asyncio.Lock()):
                 await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh, run_id, expensive=True)
             self._refresh_counts(run_id)
@@ -156,17 +153,20 @@ class RunOrchestrator:
         except SafeStop:
             self.db.update_run(run_id, status="stopped", desired_status="stopped", stage="stopped",
                                current_work="Stopped safely", finished_at=now_iso())
+        except asyncio.CancelledError:
+            self.db.update_run(run_id, status="paused", desired_status="paused", stage="interrupted",
+                               current_work="Worker interrupted safely; resume continues durable queues")
+            raise
         except Exception as exc:
             self.db.add_error(run_id, "orchestrator", f"{type(exc).__name__}: {exc}", retryable=True)
             self.db.update_run(run_id, status="failed", desired_status="paused", stage="failed", error=str(exc),
                                current_work="Run failed — inspect errors, then resume")
         finally:
-            analytics_stop.set()
-            if analytics:
-                await asyncio.gather(analytics,return_exceptions=True)
-            if processor:
-                processor.cancel()
-                await asyncio.gather(processor, return_exceptions=True)
+            stages_stop.set()
+            for task in stage_tasks:
+                task.cancel()
+            if stage_tasks:
+                await asyncio.gather(*stage_tasks, return_exceptions=True)
             if rt:
                 await rt.aclose()
             self.runtime_metrics.pop(run_id, None)
@@ -206,19 +206,30 @@ class RunOrchestrator:
 
     async def _collect(self, rt: Runtime, run: dict[str, Any]) -> None:
         run_id = run["run_id"]
-        pending = asyncio.Queue()
-        for row in self.db.rows("SELECT * FROM run_wallets WHERE run_id=? AND status='pending' AND attempts<3 ORDER BY attempts,address", (run_id,)):
-            pending.put_nowait(row)
         async def worker():
-            while not pending.empty():
+            while True:
                 await self._checkpoint(run_id)
-                try:
-                    row = pending.get_nowait()
-                except asyncio.QueueEmpty:
+                with self.db.connect() as db:
+                    candidate = db.execute(
+                        """SELECT entity_id,address FROM run_wallets WHERE run_id=? AND status='pending'
+                           AND attempts<3 ORDER BY attempts,address LIMIT 1""", (run_id,),
+                    ).fetchone()
+                    if not candidate:
+                        row = None
+                    else:
+                        claimed = db.execute(
+                            """UPDATE run_wallets SET status='running',attempts=attempts+1,started_at=?
+                               WHERE run_id=? AND entity_id=? AND address=? AND status='pending'""",
+                            (now_iso(), run_id, candidate[0], candidate[1]),
+                        ).rowcount
+                        row = dict(db.execute(
+                            "SELECT * FROM run_wallets WHERE run_id=? AND entity_id=? AND address=?",
+                            (run_id, candidate[0], candidate[1]),
+                        ).fetchone()) if claimed else None
+                if row is None:
                     return
                 eid,address = row["entity_id"],row["address"]
                 self.db.update_run(run_id,stage="historical_backfill",current_work=f"{eid}: collecting wallet history")
-                self.db.execute("UPDATE run_wallets SET status='running',attempts=attempts+1,started_at=? WHERE run_id=? AND entity_id=? AND address=?", (now_iso(),run_id,eid,address))
                 status, error = "completed", None
                 try:
                     result = await asyncio.wait_for(self._collect_wallet(rt,run,row,run["settings"].get("max_pages")), timeout=float(os.getenv("SMARTWALLET_WALLET_TIMEOUT","600")))
@@ -236,7 +247,6 @@ class RunOrchestrator:
                 self._refresh_counts(run_id)
                 if run_id in self._wakeups:
                     self._wakeups[run_id].set()
-                pending.task_done()
         tasks = [asyncio.create_task(worker()) for _ in range(max(1,min(rt.settings.concurrency,8)))]
         try:
             await asyncio.gather(*tasks)
@@ -260,18 +270,170 @@ class RunOrchestrator:
             return {"events":count}
         if address.startswith("0x"):
             result = await backfill_evm_wallet(rt.debank, rt.storage, entity_id=row["entity_id"], address=address,
-                                               min_timestamp=parse_date(run["from_date"]), max_pages=max_pages)
-            try:
-                await snapshot_evm_wallet_context(rt.arkham, rt.oklink, rt.gecko, rt.storage,
-                                                  entity_id=row["entity_id"], address=address, max_tokens=3)
-            except Exception as exc:
-                result["context_error"] = str(exc)[:2000]
-                self.db.add_error(run["run_id"], "wallet_context", str(exc), entity_id=row["entity_id"], item=address)
+                                               min_timestamp=parse_date(run["from_date"]),
+                                               max_timestamp=parse_date(run["to_date"])+86399, max_pages=max_pages)
+            self.db.execute(
+                """INSERT OR IGNORE INTO deferred_jobs(run_id,kind,item_key,entity_id,payload_json,priority,updated_at)
+                   VALUES(?,'wallet_context',?,?,?,0,?)""",
+                (run["run_id"], address.lower(), row["entity_id"], json.dumps({"address": address}), now_iso()),
+            )
             self.db.execute("INSERT OR IGNORE INTO wallet_collection_cache VALUES(?,?,?,?,?)", cache_params)
+            self.db.execute(
+                """INSERT OR IGNORE INTO run_events(run_id,event_id)
+                   SELECT ?,event_id FROM wallet_events WHERE entity_id=? AND wallet=? AND ts BETWEEN ? AND ?""",
+                (run["run_id"], row["entity_id"], address.lower(), cache_params[2], cache_params[3]),
+            )
             return result
         if row.get("chain") == "solana":
             return await collect_solana_wallet(rt.jupiter, rt.storage, entity_id=row["entity_id"], address=address, max_pages=max_pages)
         raise RuntimeError("Unsupported chain: " + str(row.get("chain")))
+
+    async def _stage_loop(self, rt: Runtime, run_id: str, stage: str, stop: asyncio.Event) -> None:
+        handlers = {
+            "episodes": self._build_once,
+            "classification": self._classify_once,
+            "market": self._market_once,
+            "analysis": self._analyze_once,
+            "enrichment": self._enrich_once,
+        }
+        while not stop.is_set():
+            try:
+                await self._checkpoint(run_id)
+                worked = await handlers[stage](rt, run_id)
+                if not worked:
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=0.35 if stage != "enrichment" else 1.0)
+                    except asyncio.TimeoutError:
+                        pass
+            except SafeStop:
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.db.add_error(run_id, stage, f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(0.5)
+
+    async def _build_once(self, rt: Runtime, run_id: str) -> int:
+        run = self.db.run(run_id)
+        if not run:
+            return 0
+        threshold = float(run["settings"].get("enrichment_threshold", 100000) or 0)
+        with self.db.connect() as db:
+            db.execute(
+                """INSERT OR IGNORE INTO deferred_jobs(run_id,kind,item_key,entity_id,payload_json,priority,updated_at)
+                   SELECT ?, 'tx_enrichment', e.chain||':'||e.tx_hash,e.entity_id,
+                          json_object('event_id',e.event_id),CAST(COALESCE(e.usd_value,0) AS INTEGER),?
+                   FROM run_events r JOIN wallet_events e USING(event_id)
+                   WHERE r.run_id=? AND r.built=0 AND e.tx_hash IS NOT NULL AND COALESCE(e.usd_value,0)>=?""",
+                (run_id, now_iso(), run_id, threshold),
+            )
+        built = 0
+        for entity_id in run["entities"]:
+            windows = dirty_windows(rt.storage, run_id, entity_id, rt.settings.episode_gap_seconds, limit=5000)
+            for start_ts, end_ts in windows[:8]:
+                episodes = await asyncio.to_thread(
+                    build_episodes, rt.storage, entity_id, rt.settings.episode_gap_seconds,
+                    rt.settings.max_episode_events, start_ts=start_ts, end_ts=end_ts, run_id=run_id,
+                )
+                built += len(episodes)
+        return built
+
+    async def _classify_once(self, rt: Runtime, run_id: str) -> int:
+        run = self.db.run(run_id)
+        if not run:
+            return 0
+        completed = 0
+        started = time.perf_counter()
+        for entity_id in run["entities"]:
+            completed += await classify_episodes(rt.storage, None, entity_id, run_id=run_id, limit=1000)
+        if completed and run_id in self.runtime_metrics:
+            self.runtime_metrics[run_id]["classification_completed"] += completed
+            self.runtime_metrics[run_id]["classification_seconds"] += time.perf_counter() - started
+        return completed
+
+    async def _market_once(self, rt: Runtime, run_id: str) -> int:
+        episodes = rt.storage.fetchall(
+            """SELECT e.* FROM episodes e JOIN run_episodes r USING(episode_id) WHERE r.run_id=?
+               AND EXISTS(SELECT 1 FROM market_horizons h WHERE h.episode_id=e.episode_id
+               AND h.state IN ('pending','retryable failure') AND h.next_retry<=?)
+               ORDER BY e.start_ts LIMIT 2000""", (run_id, time.time()),
+        )
+        if not episodes:
+            return 0
+        result = await MarketLabeler(rt.llama, rt.storage).label_episodes(
+            episodes, DEFAULT_HORIZONS, concurrency=min(8, rt.settings.concurrency),
+        )
+        runtime = self.runtime_metrics.get(run_id)
+        if runtime is not None:
+            for key in ("cache_hits", "fetched_points", "unavailable_points", "external_calls", "horizons_processed"):
+                runtime[f"market_{key}"] += result.get(key, 0)
+            runtime["market_seconds"] += result.get("elapsed_seconds", 0.0)
+        return int(result.get("horizons_processed", 0))
+
+    async def _analyze_once(self, rt: Runtime, run_id: str) -> int:
+        async with self.analysis_locks.setdefault(run_id, asyncio.Lock()):
+            result = await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh, run_id, batch_size=2000)
+        return int(result.get("observations", 0)) + int(result.get("primary_observations", 0))
+
+    async def _enrich_once(self, rt: Runtime, run_id: str) -> int:
+        with self.db.connect() as db:
+            row = db.execute(
+                """SELECT * FROM deferred_jobs WHERE run_id=? AND state IN ('pending','retryable')
+                   AND next_retry<=? ORDER BY priority DESC,updated_at LIMIT 1""", (run_id, time.time()),
+            ).fetchone()
+            if not row:
+                return 0
+            claimed = db.execute(
+                """UPDATE deferred_jobs SET state='running',attempts=attempts+1,updated_at=?
+                   WHERE run_id=? AND kind=? AND item_key=? AND state IN ('pending','retryable')""",
+                (now_iso(), run_id, row["kind"], row["item_key"]),
+            ).rowcount
+        if not claimed:
+            return 0
+        job = dict(row)
+        try:
+            payload = json.loads(job["payload_json"] or "{}")
+            if job["kind"] == "wallet_context":
+                await snapshot_evm_wallet_context(rt.arkham, rt.oklink, rt.gecko, rt.storage,
+                                                  entity_id=job["entity_id"], address=payload["address"], max_tokens=3)
+            elif job["kind"] == "tx_enrichment":
+                event = rt.storage.fetchone("SELECT * FROM wallet_events WHERE event_id=?", (payload["event_id"],))
+                if event:
+                    await enrich_evm_event(rt.storage, rt.oklink, rt.arkham, rt.rpc, rt.bridges, event,
+                                           bridge_min_usd=rt.settings.bridge_check_min_usd)
+                    with self.db.connect() as db:
+                        db.execute(
+                            """UPDATE run_events SET built=0 WHERE run_id=? AND event_id IN
+                               (SELECT event_id FROM wallet_events WHERE tx_hash=? AND chain=?)""",
+                            (run_id, event["tx_hash"], event["chain"]),
+                        )
+            self.db.execute("UPDATE deferred_jobs SET state='complete',error=NULL,updated_at=? WHERE run_id=? AND kind=? AND item_key=?",
+                            (now_iso(), run_id, job["kind"], job["item_key"]))
+        except Exception as exc:
+            attempts = int(job["attempts"]) + 1
+            state = "failed" if attempts >= 3 else "retryable"
+            self.db.execute(
+                """UPDATE deferred_jobs SET state=?,error=?,next_retry=?,updated_at=?
+                   WHERE run_id=? AND kind=? AND item_key=?""",
+                (state, str(exc)[:500], 0 if state == "failed" else time.time() + 2**attempts,
+                 now_iso(), run_id, job["kind"], job["item_key"]),
+            )
+        return 1
+
+    def _core_pending(self, run_id: str) -> int:
+        now = time.time()
+        queries = (
+            ("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=0", (run_id,)),
+            ("""SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id)
+                WHERE r.run_id=? AND e.intent_label IS NULL""", (run_id,)),
+            ("""SELECT COUNT(*) n FROM run_episodes r JOIN market_horizons h USING(episode_id)
+                WHERE r.run_id=? AND h.state IN ('pending','retryable failure') AND h.next_retry<=?""", (run_id, now)),
+            ("""SELECT COUNT(*) n FROM run_episodes r JOIN market_labels m USING(episode_id)
+                WHERE r.run_id=? AND m.simple_return IS NOT NULL AND NOT EXISTS(
+                  SELECT 1 FROM primary_analysis_observations o WHERE o.run_id=r.run_id
+                  AND o.episode_id=r.episode_id AND o.asset_key=m.asset_key AND o.horizon_seconds=m.horizon_seconds)""", (run_id,)),
+        )
+        return sum(int((self.db.row(sql, params) or {"n": 0})["n"]) for sql, params in queries)
 
     async def _processor_loop(self, rt: Runtime, run_id: str) -> None:
         while run_id not in self._draining:
@@ -372,7 +534,7 @@ class RunOrchestrator:
     def queue_counts(self, run_id: str) -> dict[str, int]:
         run = self.db.run(run_id)
         if not run:
-            return {"episode_builder": 0, "intent_classification": 0, "market_labeling": 0, "analysis": 0}
+            return {"collection": 0, "episode_builder": 0, "intent_classification": 0, "market_labeling": 0, "analysis": 0}
         def count(sql):
             return int(self.db.row(sql, (run_id,))["n"])
         missing_primary = count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) JOIN market_labels m USING(episode_id) WHERE r.run_id=? AND m.simple_return IS NOT NULL AND NOT EXISTS(SELECT 1 FROM primary_analysis_observations o WHERE o.run_id=r.run_id AND o.episode_id=e.episode_id AND o.asset_key=m.asset_key AND o.horizon_seconds=m.horizon_seconds)")
@@ -380,6 +542,7 @@ class RunOrchestrator:
         if run.get("status") == "completed" and not count("SELECT COUNT(*) n FROM primary_analysis_observations WHERE run_id=?") and count("SELECT COUNT(*) n FROM analysis_observations WHERE run_id=?"):
             missing_primary = 0
         return {
+            "collection": count("SELECT COUNT(*) n FROM run_wallets WHERE run_id=? AND status IN ('pending','running')"),
             "episode_builder": count("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=0"),
             "intent_classification": count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NULL"),
             "market_labeling": count("SELECT COUNT(*) n FROM run_episodes r JOIN market_horizons h USING(episode_id) WHERE r.run_id=? AND h.state IN ('pending','retryable failure')"),
@@ -443,6 +606,7 @@ class RunOrchestrator:
         totals = self.db.row("SELECT COALESCE(SUM(events),0) events,COALESCE(SUM(episodes),0) episodes,COALESCE(SUM(classified),0) classified,COALESCE(SUM(market_labels),0) labels,COALESCE(SUM(usable_observations),0) analyzed FROM run_entities WHERE run_id=?", (run_id,))
         totals["built_events"] = self.db.row("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=1",(run_id,))["n"]
         totals["market_done"] = self.db.row("SELECT COUNT(*) n FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND state IN ('success','permanently unavailable')",(run_id,))["n"]
+        market_total = self.db.row("SELECT COUNT(*) n FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=?", (run_id,))["n"]
         wallets = self.db.row("SELECT COUNT(*) total,SUM(status IN ('completed','partial','failed')) done FROM run_wallets WHERE run_id=?", (run_id,))
         totals.update(wallets=wallets["done"] or 0, requests=hub.get("requests",0))
         now = time.monotonic()
@@ -472,11 +636,18 @@ class RunOrchestrator:
             etas["llm"] = etas.pop("classification")
         # Conservative sequential drain estimate. Unknown throughput is never shown as a short ETA.
         etas["total"] = sum(etas.values()) if all(v is not None for v in etas.values()) else None
+        stage_progress = {
+            "collection": totals["wallets"] / max(1, wallets["total"]),
+            "episode_builder": totals["built_events"] / max(1, totals["events"]),
+            "intent_classification": totals["classified"] / max(1, totals["episodes"]),
+            "market_labeling": totals["market_done"] / max(1, market_total),
+            "analysis": totals["analyzed"] / max(1, totals["labels"]),
+        }
         return {"api":hub,"events_per_minute":round(60*rates["events"],1),
             "wallets_per_hour":round(3600*rates["wallets"],1),"api_requests_per_second":round(rates["requests"],1),
             "intent_episodes_per_second":round(classification_rate,1),
             "market_horizons_per_second":round(market_rate,1),"market":market,
-            "eta":etas,"window_seconds":round(span)}
+            "eta":etas,"stage_progress":stage_progress,"window_seconds":round(span)}
 
     def _persist_metrics(self, run_id: str, rt: Runtime) -> None:
         hub = rt.hub.metrics

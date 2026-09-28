@@ -6,7 +6,7 @@ import json
 from collections import Counter, defaultdict
 from typing import Any
 
-from ..pipeline.entity_context import historical_entity_context, historical_wallet_context
+from ..pipeline.entity_context import _nearest_at_or_before
 from ..storage import Storage
 from ..normalize import STABLE_TOKEN_IDS, asset_key
 
@@ -81,19 +81,76 @@ def behavior_patterns(rows: list[dict[str, Any]]) -> list[str]:
 
 
 
-def _tx_enrichments(storage: Storage, tx_hash: str | None, chain: str) -> dict[str, Any]:
-    if not tx_hash:
-        return {}
+EPISODE_BUILD_VERSION = "2.0-windowed-bulk-context"
+
+
+def dirty_windows(storage: Storage, run_id: str, entity_id: str, gap_seconds: int,
+                  *, limit: int = 5000) -> list[tuple[int, int]]:
+    """Cluster dirty event timestamps into independent rebuild windows."""
     rows = storage.fetchall(
-        "SELECT source,payload_json FROM tx_enrichment WHERE tx_hash=? AND chain=? ORDER BY source",
-        (tx_hash, chain),
+        """SELECT e.ts FROM run_events r JOIN wallet_events e USING(event_id)
+           WHERE r.run_id=? AND e.entity_id=? AND r.built=0 ORDER BY e.ts LIMIT ?""",
+        (run_id, entity_id, limit),
     )
-    out: dict[str, Any] = {}
+    if not rows:
+        return []
+    clusters: list[list[int]] = []
     for row in rows:
+        ts = int(row["ts"])
+        if not clusters or ts - clusters[-1][1] > gap_seconds * 2:
+            clusters.append([ts, ts])
+        else:
+            clusters[-1][1] = ts
+    return [(start - gap_seconds, end + gap_seconds) for start, end in clusters]
+
+
+def _preload_context(storage: Storage, entity_id: str, events: list[dict[str, Any]]):
+    enrichments: dict[tuple[str, str], dict[str, Any]] = defaultdict(dict)
+    tx_hashes = sorted({str(row["tx_hash"]) for row in events if row.get("tx_hash")})
+    for start in range(0, len(tx_hashes), 400):
+        chunk = tx_hashes[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in storage.fetchall(
+            f"SELECT tx_hash,chain,source,payload_json FROM tx_enrichment WHERE tx_hash IN ({placeholders})",
+            chunk,
+        ):
+            try:
+                enrichments[(row["tx_hash"], row["chain"])][row["source"]] = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                pass
+    entity_payloads = {}
+    for row in storage.fetchall(
+        """SELECT kind,payload_json FROM entity_snapshots WHERE entity_id=? AND source='arkham'
+           AND kind IN ('history','flow','volume') ORDER BY captured_at""", (entity_id,),
+    ):
         try:
-            out[str(row["source"])] = json.loads(row["payload_json"])
-        except Exception:
-            continue
+            entity_payloads[row["kind"]] = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            pass
+    wallets = sorted({str(row["wallet"]).lower() for row in events})
+    wallet_payloads: dict[tuple[str, str], Any] = {}
+    for start in range(0, len(wallets), 400):
+        chunk = wallets[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in storage.fetchall(
+            f"""SELECT address,source,payload_json FROM wallet_positions WHERE entity_id=?
+                AND address IN ({placeholders}) AND source IN ('arkham.address_history','arkham.address_flow')
+                ORDER BY captured_at""", [entity_id, *chunk],
+        ):
+            try:
+                wallet_payloads[(row["address"].lower(), row["source"])] = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                pass
+    return enrichments, entity_payloads, wallet_payloads
+
+
+def _context_at(payloads: dict[str, Any], chain: str, ts: int) -> dict[str, Any]:
+    out = {}
+    for kind, payload in payloads.items():
+        rows = payload.get(chain) if isinstance(payload, dict) else None
+        point = _nearest_at_or_before(rows, ts) if isinstance(rows, list) else None
+        if point:
+            out[kind] = point
     return out
 
 
@@ -112,6 +169,23 @@ def build_episodes(
     Incremental callers expand the dirty interval by ``gap_seconds`` before calling this
     function. Existing overlapping episodes are replaced after the new set is prepared.
     """
+    # Pull complete pre-existing episodes touching the dirty window into the rebuild.
+    # This keeps episode membership exact at both gap boundaries without rescanning the entity.
+    if run_id and start_ts is not None and end_ts is not None:
+        for _ in range(8):
+            boundary = storage.fetchone(
+                """SELECT MIN(e.start_ts) first_ts,MAX(e.end_ts) last_ts
+                   FROM run_episodes r JOIN episodes e USING(episode_id)
+                   WHERE r.run_id=? AND e.entity_id=? AND e.end_ts>=? AND e.start_ts<=?""",
+                (run_id, entity_id, start_ts, end_ts),
+            )
+            if not boundary or boundary["first_ts"] is None:
+                break
+            expanded_start = min(start_ts, int(boundary["first_ts"]))
+            expanded_end = max(end_ts, int(boundary["last_ts"]))
+            if (expanded_start, expanded_end) == (start_ts, end_ts):
+                break
+            start_ts, end_ts = expanded_start, expanded_end
     sql = "SELECT * FROM wallet_events WHERE entity_id=?"
     params: list[Any] = [entity_id]
     if run_id:
@@ -124,11 +198,13 @@ def build_episodes(
         sql += " AND ts<=?"
         params.append(int(end_ts))
     sql += " ORDER BY ts,event_id"
+    window_start, window_end = start_ts, end_ts
     events = storage.fetchall(sql, params)
     if not events:
         return []
     for e in events:
         e["evidence"] = json.loads(e["evidence_json"])
+    enrichments, entity_payloads, wallet_payloads = _preload_context(storage, entity_id, events)
     dsu = DSU(len(events))
     by_wallet: dict[str, list[int]] = defaultdict(list)
     for i, e in enumerate(events):
@@ -170,7 +246,7 @@ def build_episodes(
 
     arkham_chain = {"eth":"ethereum", "arb":"arbitrum_one", "op":"optimism", "matic":"polygon", "avax":"avalanche"}
     for rows in bounded_groups:
-        start_ts, end_ts = rows[0]["ts"], rows[-1]["ts"]
+        episode_start, episode_end = rows[0]["ts"], rows[-1]["ts"]
         motif = ">".join(_action_token(r) for r in rows)
         patterns = behavior_patterns(rows)
         asset_weights: Counter[str] = Counter()
@@ -192,11 +268,21 @@ def build_episodes(
         episode_id = hashlib.sha256(json.dumps([entity_id, [r["event_id"] for r in rows]], separators=(",", ":")).encode()).hexdigest()
         chains = Counter(r["chain"] for r in rows)
         context_chain = arkham_chain.get(chains.most_common(1)[0][0], chains.most_common(1)[0][0])
+        entity_context = _context_at(entity_payloads, context_chain, episode_start)
+        wallet_context = {}
+        for wallet in wallets:
+            payloads = {
+                "history": wallet_payloads.get((wallet.lower(), "arkham.address_history"), {}),
+                "flow": wallet_payloads.get((wallet.lower(), "arkham.address_flow"), {}),
+            }
+            value = _context_at(payloads, context_chain, episode_start)
+            if value:
+                wallet_context[wallet] = value
         episode = {
             "episode_id": episode_id,
             "entity_id": entity_id,
-            "start_ts": start_ts,
-            "end_ts": end_ts,
+            "start_ts": episode_start,
+            "end_ts": episode_end,
             "wallets": wallets,
             "event_ids": [r["event_id"] for r in rows],
             "motif": motif,
@@ -211,27 +297,69 @@ def build_episodes(
                         "action_type": r["action_type"], "cate_id": r.get("cate_id"), "cex_id": r.get("cex_id"),
                         "project_id": r.get("project_id"), "usd_value": r.get("usd_value"),
                         "primary_asset_key": r.get("primary_asset_key"), "evidence": r["evidence"],
-                        "tx_enrichments": _tx_enrichments(storage, r.get("tx_hash"), r["chain"]),
+                        "tx_enrichments": enrichments.get((r.get("tx_hash"), r["chain"]), {}),
                     }
                     for r in rows
                 ],
-                "entity_context_pre_event": historical_entity_context(storage, entity_id, context_chain, start_ts),
-                "wallet_context_pre_event": {
-                    w: historical_wallet_context(storage, entity_id, w, context_chain, start_ts) for w in wallets
-                },
+                "entity_context_pre_event": entity_context,
+                "wallet_context_pre_event": wallet_context,
             },
         }
         out.append(episode)
+    replaced: list[str] = []
     if run_id:
-        with storage.conn() as db:
-            db.execute("DELETE FROM run_episodes WHERE run_id=? AND episode_id IN (SELECT episode_id FROM episodes WHERE entity_id=?)", (run_id, entity_id))
-    for episode in out:
-        storage.save_episode(episode)
+        overlap_sql = """SELECT e.episode_id FROM run_episodes r JOIN episodes e USING(episode_id)
+                         WHERE r.run_id=? AND e.entity_id=?"""
+        overlap_params: list[Any] = [run_id, entity_id]
+        if window_start is not None:
+            overlap_sql += " AND e.end_ts>=?"
+            overlap_params.append(int(window_start))
+        if window_end is not None:
+            overlap_sql += " AND e.start_ts<=?"
+            overlap_params.append(int(window_end))
+        replaced = [row["episode_id"] for row in storage.fetchall(overlap_sql, overlap_params)]
+    current_inputs = {
+        ep["episode_id"]: hashlib.sha256(json.dumps(ep["event_ids"], separators=(",", ":")).encode()).hexdigest()
+        for ep in out
+    }
+    previous = {}
+    episode_ids = list(current_inputs)
+    for offset in range(0, len(episode_ids), 400):
+        chunk = episode_ids[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in storage.fetchall(
+            f"""SELECT artifact_id,version,input_hash FROM artifact_provenance
+                WHERE artifact_type='episode' AND artifact_id IN ({placeholders})""", chunk,
+        ):
+            previous[row["artifact_id"]] = (row["version"], row["input_hash"])
+    changed = [episode_id for episode_id, input_hash in current_inputs.items()
+               if previous.get(episode_id) != (EPISODE_BUILD_VERSION, input_hash)]
+    storage.save_episodes(out, run_id=run_id, replace_episode_ids=replaced)
+    with storage.conn() as db:
         if run_id:
-            with storage.conn() as db:
-                db.execute("INSERT OR IGNORE INTO run_episodes VALUES(?,?)", (run_id, episode["episode_id"]))
-                db.executemany("INSERT OR IGNORE INTO market_horizons(episode_id,horizon_seconds) VALUES(?,?)", [(episode["episode_id"], h) for h in (300,3600,21600,86400,259200)])
+            for offset in range(0, len(changed), 400):
+                chunk = changed[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                db.execute(
+                    f"DELETE FROM primary_analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
+                    [run_id, *chunk],
+                )
+        db.executemany(
+            """INSERT INTO artifact_provenance(artifact_type,artifact_id,version,input_hash,updated_at)
+               VALUES('episode',?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(artifact_type,artifact_id) DO UPDATE SET
+               version=excluded.version,input_hash=excluded.input_hash,updated_at=excluded.updated_at""",
+            [(ep["episode_id"], EPISODE_BUILD_VERSION, current_inputs[ep["episode_id"]]) for ep in out],
+        )
     if run_id:
         with storage.conn() as db:
-            db.execute("UPDATE run_events SET built=1 WHERE run_id=? AND event_id IN (SELECT event_id FROM wallet_events WHERE entity_id=?)", (run_id, entity_id))
+            update = """UPDATE run_events SET built=1 WHERE run_id=? AND event_id IN
+                        (SELECT event_id FROM wallet_events WHERE entity_id=?"""
+            update_params: list[Any] = [run_id, entity_id]
+            if window_start is not None:
+                update += " AND ts>=?"
+                update_params.append(int(window_start))
+            if window_end is not None:
+                update += " AND ts<=?"
+                update_params.append(int(window_end))
+            db.execute(update + ")", update_params)
     return out

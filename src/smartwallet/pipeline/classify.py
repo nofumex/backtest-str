@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import hashlib
 import json
 import math
 import sys
@@ -452,10 +453,28 @@ async def classify_episodes(
         await _bounded_map(unknown_indexes, enrich, concurrency)
 
     now = utc_now_iso()
+    episode_ids = [row["episode_id"] for row in rows]
     with storage.conn() as db:
         db.executemany(
             "UPDATE episodes SET intent_label=?,intent_json=?,intent_confidence=?,classified_at=? WHERE episode_id=?",
             [(result["label"], canonical_json(result), result["confidence"], now, row["episode_id"])
              for row, result in zip(rows, results)],
         )
+        db.executemany(
+            """INSERT INTO artifact_provenance(artifact_type,artifact_id,version,input_hash,updated_at)
+               VALUES('classification',?,?,?,?) ON CONFLICT(artifact_type,artifact_id) DO UPDATE SET
+               version=excluded.version,input_hash=excluded.input_hash,updated_at=excluded.updated_at""",
+            [(row["episode_id"], CLASSIFIER_VERSION,
+              hashlib.sha256(canonical_json([row.get("motif"), row.get("evidence_json"), CLASSIFIER_VERSION]).encode()).hexdigest(), now)
+             for row in rows],
+        )
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='analysis_observations'").fetchone():
+            for start in range(0, len(episode_ids), 400):
+                chunk = episode_ids[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                if run_id:
+                    db.execute(f"DELETE FROM analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
+                               [run_id, *chunk])
+                else:
+                    db.execute(f"DELETE FROM analysis_observations WHERE episode_id IN ({placeholders})", chunk)
     return len(rows)

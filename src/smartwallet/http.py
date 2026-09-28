@@ -52,6 +52,7 @@ class HubClient:
         self._cooldowns = {}
         self._rate_locks = {}
         self._next_start = {}
+        self._adaptive_rps = {}
         self.metrics = {"requests": 0, "success": 0, "cache_hit": 0, "retry": 0, "failed": 0}
 
     async def aclose(self) -> None:
@@ -103,7 +104,7 @@ class HubClient:
         return await self._execute(endpoint_key, spec.provider, spec.method, path, query, body, allow_upstream_error)
 
     async def _execute(self, endpoint, provider, method, path, query=None, body=None, allow_error=False):
-        limit = self._limits.setdefault(provider, asyncio.Semaphore(max(1, min(4, self.settings.concurrency))))
+        limit = self._limits.setdefault(provider, asyncio.Semaphore(max(1, self.settings.concurrency)))
         attempts = max(1, min(8, self.settings.http_retries))
         for attempt in range(1, attempts + 1):
             retryable, status, response = True, None, None
@@ -112,7 +113,9 @@ class HubClient:
                     lock = self._rate_locks.setdefault(provider, asyncio.Lock())
                     async with lock:
                         await asyncio.sleep(max(0, max(self._cooldowns.get(provider,0),self._next_start.get(provider,0))-time.time()))
-                        rps = max(.1,float(os.getenv("SMARTWALLET_PROVIDER_RPS", "4")))
+                        env_key = "SMARTWALLET_PROVIDER_RPS_" + provider.upper().replace(".", "_").replace("-", "_")
+                        configured = max(.1, float(os.getenv(env_key, os.getenv("SMARTWALLET_PROVIDER_RPS", str(min(8, self.settings.concurrency))))))
+                        rps = self._adaptive_rps.setdefault(provider, configured)
                         self._next_start[provider] = time.time()+1/rps
                     self.metrics["requests"] += 1
                     response = await self._client.request(method, path, params=query, json=body if method != "GET" else None)
@@ -130,6 +133,8 @@ class HubClient:
                     retryable = code in (-32005,-32002)
                     raise HubError("RPC error")
                 self.metrics["success"] += 1
+                ceiling = max(.1, float(os.getenv("SMARTWALLET_PROVIDER_RPS_MAX", str(max(8, self.settings.concurrency)))))
+                self._adaptive_rps[provider] = min(ceiling, self._adaptive_rps.get(provider, 1.0) + 0.05)
                 self._record(endpoint, provider, attempt, "success", None, None)
                 return HubResponse(endpoint, status, payload.get("result") if endpoint.startswith("rpc.") else payload.get("data"), payload)
             except (httpx.TransportError, ValueError, HubError) as exc:
@@ -145,6 +150,7 @@ class HubClient:
                 self.metrics["retry"] += 1
                 if status == 429:
                     self._cooldowns[provider] = next_retry
+                    self._adaptive_rps[provider] = max(.1, self._adaptive_rps.get(provider, 1.0) * 0.5)
                 await asyncio.sleep(delay)
 
     def _record(self, endpoint, provider, attempt, state, error, next_retry):

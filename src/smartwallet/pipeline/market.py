@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import time
 from collections import defaultdict
@@ -148,7 +149,7 @@ class MarketLabeler:
         for asset_chunk in _chunks(assets, 400):
             placeholders = ",".join("?" for _ in asset_chunk)
             rows = self.storage.fetchall(
-                f"""SELECT asset_key,timestamp,price,status,reason,source,resolution
+                f"""SELECT asset_key,timestamp,price,status,reason,source,resolution,expires_at
                     FROM market_time_series WHERE asset_key IN ({placeholders})
                       AND timestamp BETWEEN ? AND ? ORDER BY fetched_at""",
                 [*asset_chunk, low, high],
@@ -165,10 +166,12 @@ class MarketLabeler:
         now = utc_now_iso()
         with self.storage.conn() as db:
             db.executemany(
-                """INSERT INTO market_time_series(asset_key,timestamp,bucket,price,source,fetched_at,resolution,status,reason)
-                   VALUES(?,?,?,?,?,?,?, ?,?) ON CONFLICT(asset_key,timestamp,resolution,source) DO UPDATE SET
-                   price=excluded.price,fetched_at=excluded.fetched_at,status=excluded.status,reason=excluded.reason""",
-                [(asset, ts, ts, price, PRICE_SOURCE, now, EXACT_RESOLUTION, status, reason)
+                """INSERT INTO market_time_series(asset_key,timestamp,bucket,price,source,fetched_at,resolution,status,reason,expires_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(asset_key,timestamp,resolution,source) DO UPDATE SET
+                   price=excluded.price,fetched_at=excluded.fetched_at,status=excluded.status,
+                   reason=excluded.reason,expires_at=excluded.expires_at""",
+                [(asset, ts, ts, price, PRICE_SOURCE, now, EXACT_RESOLUTION, status, reason,
+                  0 if status == "success" else time.time() + (21600 if status == "unavailable" else 60))
                  for asset, ts, price, status, reason in rows],
             )
 
@@ -207,7 +210,10 @@ class MarketLabeler:
         self, points: set[tuple[str, int]], concurrency: int,
     ) -> tuple[dict[tuple[str, int], dict[str, Any]], dict[str, int]]:
         cached = self._load_cache(points)
-        reusable = {key: row for key, row in cached.items() if row["status"] in {"success", "unavailable"}}
+        now = time.time()
+        reusable = {key: row for key, row in cached.items()
+                    if row["status"] == "success" or
+                    (row["status"] == "unavailable" and float(row.get("expires_at") or 0) > now)}
         missing = points - set(reusable)
         metrics = {
             "unique_points": len(points), "cache_hits": len(reusable), "fetched_points": 0,
@@ -341,10 +347,21 @@ class MarketLabeler:
                 state_rows.append((status, reason, attempts, 0 if attempts >= 3 else time.time() + min(60, 2**attempts), eid, horizon))
                 failures += 1
                 continue
+            if any(row.get("status") == "unavailable" for row in required):
+                attempts = int(state["attempts"]) + 1
+                status = "permanently unavailable" if attempts >= 3 else "retryable failure"
+                retry_at = max((float(row.get("expires_at") or 0) for row in required), default=time.time() + 21600)
+                reason = "provider has no historical price; negative cache will be revalidated"
+                if attempts >= 3:
+                    reason = "retry budget exhausted: " + reason
+                state_rows.append((status, reason, attempts, 0 if attempts >= 3 else retry_at, eid, horizon))
+                failures += 1
+                continue
             p0, p1 = self._price(cache, asset, start), self._price(cache, asset, start + horizon)
             simple = ret(p0, p1)
             if simple is None:
-                state_rows.append(("permanently unavailable", "provider has no historical price", state["attempts"], 0, eid, horizon))
+                state_rows.append(("retryable failure", "market point temporarily unavailable", int(state["attempts"]) + 1,
+                                   time.time() + 21600, eid, horizon))
                 continue
             bp0, bp1 = self._price(cache, BTC, start), self._price(cache, BTC, start + horizon)
             ep0, ep1 = self._price(cache, ETH, start), self._price(cache, ETH, start + horizon)
@@ -380,6 +397,14 @@ class MarketLabeler:
             db.executemany(
                 """INSERT OR REPLACE INTO episode_market_context(episode_id,source,btc_return_24h,eth_return_24h,
                    btc_volatility_proxy,eth_volatility_proxy,regime,payload_json) VALUES(?,?,?,?,?,?,?,?)""", context_rows,
+            )
+            db.executemany(
+                """INSERT INTO artifact_provenance(artifact_type,artifact_id,version,input_hash,updated_at)
+                   VALUES('market_label',?,'2.0-bulk-exact',?,?) ON CONFLICT(artifact_type,artifact_id) DO UPDATE SET
+                   version=excluded.version,input_hash=excluded.input_hash,updated_at=excluded.updated_at""",
+                [(f"{row[0]}|{row[1]}|{row[2]}",
+                  hashlib.sha256(canonical_json([row[0], row[1], row[2], row[4], row[5]]).encode()).hexdigest(),
+                  utc_now_iso()) for row in label_rows],
             )
         metrics.update(labels=len(label_rows), failed=failures,
                        elapsed_seconds=time.perf_counter() - started,

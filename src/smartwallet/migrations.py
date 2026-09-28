@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS classification_jobs(run_id TEXT,episode_id TEXT,attem
 CREATE TABLE IF NOT EXISTS assets(asset_key TEXT PRIMARY KEY,symbol TEXT,name TEXT);
 CREATE TABLE IF NOT EXISTS market_time_series(asset_key TEXT NOT NULL,timestamp INTEGER NOT NULL,bucket INTEGER NOT NULL,price REAL,source TEXT NOT NULL,fetched_at TEXT NOT NULL,resolution INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'success',reason TEXT,PRIMARY KEY(asset_key,timestamp,resolution,source));
 CREATE INDEX IF NOT EXISTS idx_market_series_lookup ON market_time_series(asset_key,timestamp,status);
+CREATE TABLE IF NOT EXISTS wallet_history_coverage(entity_id TEXT NOT NULL,address TEXT NOT NULL,chain TEXT NOT NULL,covered_from INTEGER NOT NULL DEFAULT 0,covered_to INTEGER NOT NULL DEFAULT 0,cursor INTEGER NOT NULL DEFAULT 0,pages INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'pending',updated_at TEXT NOT NULL,PRIMARY KEY(entity_id,address,chain));
+CREATE TABLE IF NOT EXISTS deferred_jobs(run_id TEXT NOT NULL,kind TEXT NOT NULL,item_key TEXT NOT NULL,entity_id TEXT,payload_json TEXT NOT NULL DEFAULT '{}',state TEXT NOT NULL DEFAULT 'pending',priority INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_retry REAL NOT NULL DEFAULT 0,error TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(run_id,kind,item_key));
+CREATE INDEX IF NOT EXISTS idx_deferred_jobs_queue ON deferred_jobs(run_id,kind,state,next_retry,priority);
+CREATE TABLE IF NOT EXISTS artifact_provenance(artifact_type TEXT NOT NULL,artifact_id TEXT NOT NULL,version TEXT NOT NULL,input_hash TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(artifact_type,artifact_id));
 INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);
 """
 
@@ -49,3 +53,8 @@ def migrate(db):
             if name not in columns:
                 db.execute(f"ALTER TABLE run_metrics ADD COLUMN {name} {definition}")
         db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(4)")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='market_time_series'").fetchone():
+        columns = {r[1] for r in db.execute("PRAGMA table_info(market_time_series)")}
+        if "expires_at" not in columns:
+            db.execute("ALTER TABLE market_time_series ADD COLUMN expires_at REAL NOT NULL DEFAULT 0")
+        db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(5)")

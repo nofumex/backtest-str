@@ -195,9 +195,48 @@ CREATE TABLE IF NOT EXISTS market_time_series (
     resolution INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'success',
     reason TEXT,
+    expires_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY(asset_key, timestamp, resolution, source)
 );
 CREATE INDEX IF NOT EXISTS idx_market_series_lookup ON market_time_series(asset_key,timestamp,status);
+
+CREATE TABLE IF NOT EXISTS wallet_history_coverage (
+    entity_id TEXT NOT NULL,
+    address TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    covered_from INTEGER NOT NULL DEFAULT 0,
+    covered_to INTEGER NOT NULL DEFAULT 0,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    pages INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(entity_id,address,chain)
+);
+
+CREATE TABLE IF NOT EXISTS deferred_jobs (
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    entity_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry REAL NOT NULL DEFAULT 0,
+    error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(run_id,kind,item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_deferred_jobs_queue ON deferred_jobs(run_id,kind,state,next_retry,priority);
+
+CREATE TABLE IF NOT EXISTS artifact_provenance (
+    artifact_type TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(artifact_type,artifact_id)
+);
 
 CREATE TABLE IF NOT EXISTS market_snapshots (
     captured_at TEXT NOT NULL,
@@ -248,6 +287,7 @@ class Storage:
         settings.report_dir.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._archive_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="raw-writer")
+        self._archive_slots = threading.BoundedSemaphore(256)
         with self.conn() as db:
             db.executescript(SCHEMA)
             from .migrations import migrate
@@ -301,15 +341,22 @@ class Storage:
         if not path.exists():
             with gzip.open(path, "wb") as f:
                 f.write(blob)
-        with self.conn() as db:
+        db = sqlite3.connect(self.settings.db_path, timeout=30)
+        try:
             db.execute(
                 "INSERT OR IGNORE INTO raw_responses(provider,endpoint_key,request_json,response_json,fetched_at,sha256) VALUES(?,?,?,?,?,?)",
                 (provider, endpoint_key, canonical_json(request), canonical_json(response), record["fetched_at"], digest),
             )
+            db.commit()
+        finally:
+            db.close()
         return digest
 
     def archive_raw_queued(self, provider: str, endpoint_key: str, request: dict[str, Any], response: Any) -> Future:
-        return self._archive_executor.submit(self.archive_raw, provider, endpoint_key, request, response)
+        self._archive_slots.acquire()
+        future = self._archive_executor.submit(self.archive_raw, provider, endpoint_key, request, response)
+        future.add_done_callback(lambda _: self._archive_slots.release())
+        return future
 
     def upsert_entity(self, entity_id: str, name: str | None, summary: dict[str, Any], metadata: dict[str, Any] | None = None) -> None:
         with self.conn() as db:
@@ -375,8 +422,6 @@ class Storage:
 
     def save_events(self, events: Iterable[dict[str, Any]]) -> None:
         events = list(events)
-        if self.run_id:
-            events = [e for e in events if self.run_bounds[0] <= e["ts"] <= self.run_bounds[1]]
         now = utc_now_iso()
         values = [(
             e["event_id"], e["entity_id"], e["wallet"], e["chain"], e.get("tx_hash"), e.get("event_index"),
@@ -386,24 +431,29 @@ class Storage:
         ) for e in events]
         if not values:
             return
+        from .normalize import asset_key
+        assets: dict[str, tuple[str, str | None]] = {}
+        for event in events:
+            for token_id, token in (event.get("evidence", {}).get("tokens") or {}).items():
+                if isinstance(token, dict):
+                    key = asset_key(event["chain"], token_id)
+                    if key and token.get("symbol"):
+                        assets[key] = (str(token["symbol"]), token.get("name"))
         with self.conn() as db:
             db.executemany(
                 """INSERT OR IGNORE INTO wallet_events(event_id,entity_id,wallet,chain,tx_hash,event_index,ts,source,
                 action_type,cate_id,cex_id,project_id,usd_value,primary_token_id,primary_asset_key,evidence_json,raw_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values,
             )
-
-        with self.conn() as db:
-            from .normalize import asset_key
-            for event in events:
-                for token_id, token in (event.get("evidence", {}).get("tokens") or {}).items():
-                    if isinstance(token, dict):
-                        key = asset_key(event["chain"], token_id)
-                        if key and token.get("symbol"):
-                            db.execute("INSERT INTO assets(asset_key,symbol,name) VALUES(?,?,?) ON CONFLICT(asset_key) DO UPDATE SET symbol=excluded.symbol,name=excluded.name", (key,token["symbol"],token.get("name")))
-        if self.run_id:
-            with self.conn() as db:
-                db.executemany("INSERT OR IGNORE INTO run_events(run_id,event_id) VALUES(?,?)", [(self.run_id,e["event_id"]) for e in events])
+            db.executemany(
+                """INSERT INTO assets(asset_key,symbol,name) VALUES(?,?,?)
+                   ON CONFLICT(asset_key) DO UPDATE SET symbol=excluded.symbol,name=excluded.name""",
+                [(key, symbol, name) for key, (symbol, name) in assets.items()],
+            )
+            if self.run_id:
+                eligible = [e for e in events if self.run_bounds[0] <= e["ts"] <= self.run_bounds[1]]
+                db.executemany("INSERT OR IGNORE INTO run_events(run_id,event_id) VALUES(?,?)",
+                               [(self.run_id, e["event_id"]) for e in eligible])
 
     def market_price_get(self, timestamp: int, coins: tuple[str, ...]) -> dict[str, Any] | None:
         key = hashlib.sha256(canonical_json([int(timestamp), coins]).encode()).hexdigest()
@@ -452,6 +502,44 @@ class Storage:
 
         with self.conn() as db:
             db.executemany("INSERT OR IGNORE INTO market_horizons(episode_id,horizon_seconds) VALUES(?,?)", [(episode["episode_id"],h) for h in (300,3600,21600,86400,259200)])
+
+    def save_episodes(self, episodes: Iterable[dict[str, Any]], *, run_id: str | None = None,
+                      replace_episode_ids: Iterable[str] = ()) -> None:
+        episodes = list(episodes)
+        if not episodes:
+            return
+        values = [(
+            ep["episode_id"], ep["entity_id"], ep["start_ts"], ep["end_ts"], canonical_json(ep["wallets"]),
+            canonical_json(ep["event_ids"]), ep["motif"], ep.get("primary_asset_key"),
+            ep.get("target_asset_key") or ep.get("primary_asset_key"), ep.get("gross_usd"),
+            canonical_json(ep.get("evidence", {})), ep.get("intent_label"),
+            canonical_json(ep.get("intent", {})) if ep.get("intent") is not None else None,
+            ep.get("intent_confidence"), ep.get("classified_at"),
+        ) for ep in episodes]
+        with self.conn() as db:
+            if run_id:
+                db.executemany("DELETE FROM run_episodes WHERE run_id=? AND episode_id=?",
+                               [(run_id, episode_id) for episode_id in replace_episode_ids])
+            db.executemany(
+                """INSERT INTO episodes(episode_id,entity_id,start_ts,end_ts,wallets_json,event_ids_json,motif,
+                   primary_asset_key,target_asset_key,gross_usd,evidence_json,intent_label,intent_json,
+                   intent_confidence,classified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(episode_id) DO UPDATE SET entity_id=excluded.entity_id,start_ts=excluded.start_ts,
+                   end_ts=excluded.end_ts,wallets_json=excluded.wallets_json,event_ids_json=excluded.event_ids_json,
+                   motif=excluded.motif,primary_asset_key=excluded.primary_asset_key,
+                   target_asset_key=excluded.target_asset_key,gross_usd=excluded.gross_usd,
+                   intent_label=CASE WHEN episodes.evidence_json=excluded.evidence_json THEN episodes.intent_label END,
+                   intent_json=CASE WHEN episodes.evidence_json=excluded.evidence_json THEN episodes.intent_json END,
+                   intent_confidence=CASE WHEN episodes.evidence_json=excluded.evidence_json THEN episodes.intent_confidence END,
+                   classified_at=CASE WHEN episodes.evidence_json=excluded.evidence_json THEN episodes.classified_at END,
+                   evidence_json=excluded.evidence_json""", values,
+            )
+            if run_id:
+                db.executemany("INSERT OR IGNORE INTO run_episodes(run_id,episode_id) VALUES(?,?)",
+                               [(run_id, ep["episode_id"]) for ep in episodes])
+            db.executemany("INSERT OR IGNORE INTO market_horizons(episode_id,horizon_seconds) VALUES(?,?)",
+                           [(ep["episode_id"], horizon) for ep in episodes
+                            for horizon in (300, 3600, 21600, 86400, 259200)])
 
     def update_episode_intent(self, episode_id: str, label: str, intent: dict[str, Any], confidence: float) -> None:
         with self.conn() as db:

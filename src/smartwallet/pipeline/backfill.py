@@ -7,6 +7,7 @@ from typing import Any
 from ..normalize import normalize_debank_event
 from ..providers import DeBankProvider, JupiterProvider
 from ..storage import Storage
+from ..storage import utc_now_iso
 
 
 def parse_date(value: str) -> int:
@@ -33,34 +34,110 @@ async def backfill_evm_wallet(
     entity_id: str,
     address: str,
     min_timestamp: int,
+    max_timestamp: int | None = None,
     max_pages: int | None = None,
 ) -> dict[str, Any]:
     chains_raw = await debank.used_chains(address)
     chains = _chain_ids(chains_raw)
+    max_timestamp = int(max_timestamp or storage.run_bounds[1])
     count = 0
     per_chain: dict[str, int] = {}
-    pending: list[dict[str, Any]] = []
+    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=max(1, min(64, len(chains) + 1)))
 
-    if not storage.position_exists(entity_id, address.lower(), "evm", "debank.portfolio_project_list"):
-        positions = await debank.positions(address)
-        storage.save_position(entity_id, address.lower(), "evm", "debank.portfolio_project_list", positions)
-
-    try:
-        for chain in chains:
-            n = 0
-            async for row, dictionaries in debank.iter_history(address, chain, min_timestamp=min_timestamp, page_count=20, max_pages=max_pages):
+    async def collect_chain(chain: str) -> tuple[str, int]:
+        coverage = storage.fetchone(
+            "SELECT * FROM wallet_history_coverage WHERE entity_id=? AND address=? AND chain=?",
+            (entity_id, address.lower(), chain),
+        )
+        if (coverage and coverage["state"] == "complete"
+                and int(coverage["covered_from"]) <= min_timestamp
+                and int(coverage["covered_to"]) >= max_timestamp):
+            cached = storage.fetchone(
+                """SELECT COUNT(*) n FROM wallet_events WHERE entity_id=? AND wallet=? AND chain=?
+                   AND ts BETWEEN ? AND ?""",
+                (entity_id, address.lower(), chain, min_timestamp, max_timestamp),
+            )
+            return chain, int(cached["n"] if cached else 0)
+        cursor = int(coverage["cursor"] or 0) if coverage and int(coverage["covered_to"] or 0) >= max_timestamp else 0
+        pages = int(coverage["pages"] or 0) if cursor else 0
+        pages_this_run = 0
+        emitted = 0
+        completed = False
+        with storage.conn() as db:
+            db.execute(
+                """INSERT INTO wallet_history_coverage(entity_id,address,chain,covered_from,covered_to,cursor,pages,state,updated_at)
+                   VALUES(?,?,?,?,?,?,?,'scanning',?) ON CONFLICT(entity_id,address,chain) DO UPDATE SET
+                   covered_to=MAX(covered_to,excluded.covered_to),state='scanning',updated_at=excluded.updated_at""",
+                (entity_id, address.lower(), chain, int(coverage["covered_from"] or 0) if coverage else 0,
+                 max_timestamp, cursor, pages, utc_now_iso()),
+            )
+        while True:
+            if max_pages is not None and pages_this_run >= max_pages:
+                break
+            page = await debank.history_page(address, chain, start_time=cursor, page_count=20)
+            rows = page.get("history_list") or []
+            if not rows:
+                completed = True
+                break
+            dictionaries = {key: page.get(key) or {} for key in
+                            ("cate_dict", "cex_dict", "memo_dict", "project_dict", "token_dict")}
+            oldest = min((int(float(row.get("time_at") or 0)) for row in rows if row.get("time_at")), default=0)
+            events = []
+            for row in rows:
                 event = normalize_debank_event(entity_id, address, chain, row, dictionaries)
-                if event["ts"] <= 0:
-                    continue
-                pending.append(event)
-                n += 1
-                count += 1
-                if len(pending) >= 500:
-                    storage.save_events(pending)
-                    pending.clear()
-            per_chain[chain] = n
-    finally:
-        storage.save_events(pending)
+                if event["ts"] > 0:
+                    events.append(event)
+                    if min_timestamp <= event["ts"] <= max_timestamp:
+                        emitted += 1
+            storage.save_events(events)
+            pages += 1
+            pages_this_run += 1
+            if not oldest or (cursor and oldest >= cursor):
+                completed = True
+            cursor = oldest or cursor
+            with storage.conn() as db:
+                db.execute(
+                    """INSERT INTO wallet_history_coverage(entity_id,address,chain,covered_from,covered_to,cursor,pages,state,updated_at)
+                       VALUES(?,?,?,?,?,?,?,'scanning',?) ON CONFLICT(entity_id,address,chain) DO UPDATE SET
+                       covered_to=MAX(covered_to,excluded.covered_to),cursor=excluded.cursor,pages=excluded.pages,
+                       state='scanning',updated_at=excluded.updated_at""",
+                    (entity_id, address.lower(), chain, int(coverage["covered_from"] or 0) if coverage else 0,
+                     max_timestamp, cursor, pages, utc_now_iso()),
+                )
+            if completed or cursor <= min_timestamp:
+                completed = True
+                break
+        if completed:
+            with storage.conn() as db:
+                db.execute(
+                    """UPDATE wallet_history_coverage SET covered_from=CASE WHEN covered_from=0 THEN ? ELSE MIN(covered_from,?) END,
+                       covered_to=MAX(covered_to,?),cursor=?,state='complete',updated_at=?
+                       WHERE entity_id=? AND address=? AND chain=?""",
+                    (min_timestamp, min_timestamp, max_timestamp, cursor, utc_now_iso(),
+                     entity_id, address.lower(), chain),
+                )
+        return chain, emitted
+
+    async def worker():
+        while True:
+            chain = await queue.get()
+            try:
+                if chain is None:
+                    return
+                key, value = await collect_chain(chain)
+                per_chain[key] = value
+            finally:
+                queue.task_done()
+
+    worker_count = max(1, min(len(chains), storage.settings.concurrency, 8))
+    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+    for chain in chains:
+        await queue.put(chain)
+    for _ in workers:
+        await queue.put(None)
+    await queue.join()
+    await asyncio.gather(*workers)
+    count = sum(per_chain.values())
     return {"entity_id": entity_id, "address": address, "chains": chains, "events": count, "per_chain": per_chain}
 
 

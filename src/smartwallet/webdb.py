@@ -331,7 +331,8 @@ class WebDB:
             db.execute("UPDATE run_wallets SET status='pending',started_at=NULL WHERE status='running'")
             db.execute(
                 """UPDATE analysis_runs SET status='paused',desired_status='paused',stage='interrupted',
-                   current_work='Process restarted — ready to resume',updated_at=? WHERE status IN ('running','stopping')""",
+                   current_work='Process restarted — ready to resume',updated_at=?
+                   WHERE status IN ('running','stopping','pausing','queued')""",
                 (now_iso(),),
             )
 

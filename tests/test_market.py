@@ -101,7 +101,7 @@ async def test_unavailable_asset_does_not_block_other_episodes(settings):
     result = await MarketLabeler(llama, storage).label_episodes(
         [episode("bad", asset="ethereum:bad"), episode("good", asset="ethereum:good")], (300,),
     )
-    assert storage.fetchone("SELECT state FROM market_horizons WHERE episode_id='bad'")["state"] == "permanently unavailable"
+    assert storage.fetchone("SELECT state FROM market_horizons WHERE episode_id='bad'")["state"] == "retryable failure"
     assert storage.fetchone("SELECT state FROM market_horizons WHERE episode_id='good'")["state"] == "success"
     assert result["labels"] == 1
 

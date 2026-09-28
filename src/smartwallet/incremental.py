@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -77,7 +78,9 @@ class IncrementalAnalyzer:
         primary_inserted, primary_dirty = self._refresh_primary(
             run_id, entities, from_ts, to_ts, batch_size,
         )
-        dirty = self._remove_stale(run_id)
+        stale_dirty = self._remove_stale(run_id)
+        dirty = set(stale_dirty)
+        deltas: dict[str, list[float | int]] = {}
         rows = self.db.rows(
             f"""SELECT e.episode_id,e.entity_id,e.start_ts,e.motif,e.evidence_json,e.intent_label,e.gross_usd,
                        m.asset_key,m.horizon_seconds,m.simple_return
@@ -114,6 +117,13 @@ class IncrementalAnalyzer:
                     if conn.total_changes > before:
                         inserted += 1
                         dirty.add(key)
+                        value = float(row["simple_return"])
+                        delta = deltas.setdefault(key, [0.0, 0.0, 0, 0, 0])
+                        delta[0] += value
+                        delta[1] += value * value
+                        delta[2] += int(value < 0)
+                        delta[3] += int(value > 0)
+                        delta[4] += 1
                         conn.execute(
                             """INSERT OR IGNORE INTO pattern_aggregates(run_id,pattern_key,entity_id,pattern,intent_label,
                                asset_key,horizon_seconds,n,sum_return,sum_sq_return,negative_count,positive_count,
@@ -121,18 +131,44 @@ class IncrementalAnalyzer:
                             (run_id, key, row["entity_id"], pattern, row["intent_label"], row["asset_key"],
                              row["horizon_seconds"], now_iso()),
                         )
-            for key in dirty:
+            existing_n = {r[0]: int(r[1]) for r in conn.execute(
+                "SELECT pattern_key,n FROM pattern_aggregates WHERE run_id=?", (run_id,)
+            )}
+            crossing = {key for key, delta in deltas.items()
+                        if any(existing_n.get(key, 0) < mark <= existing_n.get(key, 0) + int(delta[4])
+                               for mark in CHECKPOINTS)}
+            incremental = []
+            for key, delta in deltas.items():
+                if key in crossing or key in stale_dirty:
+                    continue
+                total, total_sq, neg, pos, n = delta
+                incremental.append((n, total, total_sq, neg, pos, total, n, now_iso(), run_id, key))
+            conn.executemany(
+                """UPDATE pattern_aggregates SET n=n+?,sum_return=sum_return+?,sum_sq_return=sum_sq_return+?,
+                   negative_count=negative_count+?,positive_count=positive_count+?,
+                   mean_return=(sum_return+?)/(n+?),updated_at=? WHERE run_id=? AND pattern_key=?""",
+                incremental,
+            )
+            for key in stale_dirty | crossing:
                 self._rebuild_cheap(conn, run_id, key)
 
-        if dirty:
-            # New/removed hypotheses change the family even when no p-value is recomputed.
-            with self.db.connect() as conn:
-                family = conn.execute("SELECT pattern_key,COALESCE(sign_pvalue,1.0) FROM pattern_aggregates WHERE run_id=?", (run_id,)).fetchall()
-                qvalues = bh_qvalues([r[1] for r in family])
-                conn.executemany("UPDATE pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?", [(q,run_id,r[0]) for r,q in zip(family,qvalues)])
+        # BH is deferred to the expensive refresh; doing a full family scan for every
+        # micro-batch is quadratic and existing p-values did not change here.
         if expensive:
             self.refresh_expensive(run_id, dirty_only=False)
         self.db.update_run(run_id, analysis_updated_at=now_iso())
+        with self.db.connect() as conn:
+            counts = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM primary_analysis_observations WHERE run_id=?),"
+                "(SELECT COUNT(*) FROM analysis_observations WHERE run_id=?)", (run_id, run_id),
+            ).fetchone()
+            input_hash = hashlib.sha256(f"{counts[0]}|{counts[1]}".encode()).hexdigest()
+            conn.execute(
+                """INSERT INTO artifact_provenance(artifact_type,artifact_id,version,input_hash,updated_at)
+                   VALUES('statistics',?,'2.0-incremental-bulk',?,?) ON CONFLICT(artifact_type,artifact_id)
+                   DO UPDATE SET version=excluded.version,input_hash=excluded.input_hash,updated_at=excluded.updated_at""",
+                (run_id, input_hash, now_iso()),
+            )
         return {
             "observations": inserted,
             "patterns": len(dirty),
@@ -155,6 +191,8 @@ class IncrementalAnalyzer:
             primary_pattern_key(r["entity_id"], r["pattern"], r["asset_key"], r["horizon_seconds"])
             for r in stale
         }
+        stale_dirty = set(dirty)
+        deltas: dict[str, list[float | int]] = {}
         if stale:
             with self.db.connect() as conn:
                 conn.executemany(
@@ -194,25 +232,39 @@ class IncrementalAnalyzer:
                     if conn.total_changes > before:
                         inserted += 1
                         dirty.add(key)
+                        value = float(row["simple_return"])
+                        delta = deltas.setdefault(key, [0.0, 0.0, 0, 0, 0])
+                        delta[0] += value
+                        delta[1] += value * value
+                        delta[2] += int(value < 0)
+                        delta[3] += int(value > 0)
+                        delta[4] += 1
                         conn.execute(
                             """INSERT OR IGNORE INTO primary_pattern_aggregates(run_id,pattern_key,entity_id,pattern,
                                asset_key,horizon_seconds,n,sum_return,sum_sq_return,negative_count,positive_count,
                                mean_return,maturity,updated_at) VALUES(?,?,?,?,?,?,0,0,0,0,0,0,'EARLY',?)""",
                             (run_id, key, row["entity_id"], pattern, row["asset_key"], row["horizon_seconds"], now_iso()),
                         )
-            for key in dirty:
+            existing_n = {r[0]: int(r[1]) for r in conn.execute(
+                "SELECT pattern_key,n FROM primary_pattern_aggregates WHERE run_id=?", (run_id,)
+            )}
+            crossing = {key for key, delta in deltas.items()
+                        if any(existing_n.get(key, 0) < mark <= existing_n.get(key, 0) + int(delta[4])
+                               for mark in CHECKPOINTS)}
+            incremental = []
+            for key, delta in deltas.items():
+                if key in crossing or key in stale_dirty:
+                    continue
+                total, total_sq, neg, pos, n = delta
+                incremental.append((n, total, total_sq, neg, pos, total, n, now_iso(), run_id, key))
+            conn.executemany(
+                """UPDATE primary_pattern_aggregates SET n=n+?,sum_return=sum_return+?,sum_sq_return=sum_sq_return+?,
+                   negative_count=negative_count+?,positive_count=positive_count+?,
+                   mean_return=(sum_return+?)/(n+?),updated_at=? WHERE run_id=? AND pattern_key=?""",
+                incremental,
+            )
+            for key in stale_dirty | crossing:
                 self._rebuild_primary_cheap(conn, run_id, key)
-        if dirty:
-            with self.db.connect() as conn:
-                family = conn.execute(
-                    "SELECT pattern_key,COALESCE(sign_pvalue,1.0) FROM primary_pattern_aggregates WHERE run_id=?",
-                    (run_id,),
-                ).fetchall()
-                qvalues = bh_qvalues([row[1] for row in family])
-                conn.executemany(
-                    "UPDATE primary_pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?",
-                    [(q, run_id, row[0]) for row, q in zip(family, qvalues)],
-                )
         return inserted, len(dirty)
 
     def _rebuild_primary_cheap(self, conn, run_id: str, key: str) -> None:
@@ -348,15 +400,31 @@ class IncrementalAnalyzer:
                AND (?=0 OR (n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10, CAST(CEIL(last_expensive_n*1.2) AS INTEGER))))) ORDER BY n DESC""",
             (run_id, int(dirty_only)),
         )
+        selected = {row["pattern_key"] for row in aggregates}
+        grouped_values: dict[str, list[float]] = {key: [] for key in selected}
+        if selected:
+            value_rows = self.db.rows(
+                """SELECT g.pattern_key,o.return_value FROM pattern_aggregates g
+                   JOIN analysis_observations o ON o.run_id=g.run_id AND o.entity_id=g.entity_id
+                    AND o.pattern=g.pattern AND o.intent_label=g.intent_label AND o.asset_key=g.asset_key
+                    AND o.horizon_seconds=g.horizon_seconds
+                   WHERE g.run_id=? AND g.n>0 AND (?=0 OR (g.n>=10 AND (g.last_expensive_n=0 OR
+                     g.n>=MIN(g.last_expensive_n+10,CAST(CEIL(g.last_expensive_n*1.2) AS INTEGER)))))
+                   ORDER BY g.pattern_key,o.episode_ts""", (run_id, int(dirty_only)),
+            )
+            for row in value_rows:
+                grouped_values[row["pattern_key"]].append(float(row["return_value"]))
+        prior_rows = self.db.rows(
+            """SELECT entity_id,intent_label,asset_key,horizon_seconds,AVG(return_value) prior FROM (
+                 SELECT DISTINCT entity_id,intent_label,asset_key,horizon_seconds,episode_id,return_value
+                 FROM analysis_observations WHERE run_id=?)
+               GROUP BY entity_id,intent_label,asset_key,horizon_seconds""", (run_id,),
+        )
+        priors = {(r["entity_id"], r["intent_label"], r["asset_key"], r["horizon_seconds"]): float(r["prior"] or 0)
+                  for r in prior_rows}
         updates: list[dict[str, Any]] = []
         for aggregate in aggregates:
-            values = self.db.rows(
-                """SELECT return_value FROM analysis_observations WHERE run_id=? AND entity_id=? AND pattern=?
-                   AND intent_label=? AND asset_key=? AND horizon_seconds=? ORDER BY episode_ts""",
-                (run_id, aggregate["entity_id"], aggregate["pattern"], aggregate["intent_label"],
-                 aggregate["asset_key"], aggregate["horizon_seconds"]),
-            )
-            arr = np.asarray([row["return_value"] for row in values], dtype=float)
+            arr = np.asarray(grouped_values.get(aggregate["pattern_key"], []), dtype=float)
             if not len(arr):
                 continue
             low, high = bootstrap_ci(arr, samples=1000)
@@ -381,10 +449,7 @@ class IncrementalAnalyzer:
                 old_maturity = item["maturity"]
                 maturity = maturity_for(n=item["n"], ci_low=item["low"], ci_high=item["high"], qvalue=qvalue,
                                         holdout_accuracy=item["accuracy"], train_mean=item["train_mean"], test_mean=item["test_mean"])
-                prior = conn.execute(
-                    "SELECT AVG(return_value) FROM (SELECT DISTINCT episode_id,return_value FROM analysis_observations WHERE run_id=? AND entity_id=? AND intent_label=? AND asset_key=? AND horizon_seconds=?)",
-                    (run_id, item["entity_id"], item["intent_label"], item["asset_key"], item["horizon_seconds"]),
-                ).fetchone()[0] or 0.0
+                prior = priors.get((item["entity_id"], item["intent_label"], item["asset_key"], item["horizon_seconds"]), 0.0)
                 shrunk = (item["n"] * item["mean_return"] + 20 * prior) / (item["n"] + 20)
                 conn.execute(
                     """UPDATE pattern_aggregates SET median_return=?,ci_low=?,ci_high=?,sign_pvalue=?,qvalue=?,shrunk_mean=?,
@@ -401,10 +466,12 @@ class IncrementalAnalyzer:
                     )
         with self.db.connect() as conn:
             conn.executemany("UPDATE pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?", [(q,run_id,key) for key,q in qmap.items()])
+        maturity_rows = []
         for row in self.db.rows("SELECT * FROM pattern_aggregates WHERE run_id=?", (run_id,)):
             train_mean = ((row["mean_return"]*row["n"]-(row["test_mean_return"] or 0)*(row["test_n"] or 0))/row["train_n"]) if row["train_n"] else None
-            maturity = maturity_for(n=row["n"],ci_low=row["ci_low"],ci_high=row["ci_high"],qvalue=row["qvalue"],holdout_accuracy=row["holdout_accuracy"],train_mean=train_mean,test_mean=row["test_mean_return"])
-            self.db.execute("UPDATE pattern_aggregates SET maturity=? WHERE run_id=? AND pattern_key=?", (maturity,run_id,row["pattern_key"]))
+            maturity_rows.append((maturity_for(n=row["n"],ci_low=row["ci_low"],ci_high=row["ci_high"],qvalue=row["qvalue"],holdout_accuracy=row["holdout_accuracy"],train_mean=train_mean,test_mean=row["test_mean_return"]),run_id,row["pattern_key"]))
+        with self.db.connect() as conn:
+            conn.executemany("UPDATE pattern_aggregates SET maturity=? WHERE run_id=? AND pattern_key=?", maturity_rows)
         return len(updates)
 
     def _refresh_primary_expensive(self, run_id: str, *, dirty_only: bool = True) -> int:
@@ -414,14 +481,30 @@ class IncrementalAnalyzer:
                CAST(CEIL(last_expensive_n*1.2) AS INTEGER))))) ORDER BY n DESC""",
             (run_id, int(dirty_only)),
         )
+        selected = {row["pattern_key"] for row in aggregates}
+        grouped_values: dict[str, list[float]] = {key: [] for key in selected}
+        if selected:
+            value_rows = self.db.rows(
+                """SELECT g.pattern_key,o.return_value FROM primary_pattern_aggregates g
+                   JOIN primary_analysis_observations o ON o.run_id=g.run_id AND o.entity_id=g.entity_id
+                    AND o.pattern=g.pattern AND o.asset_key=g.asset_key AND o.horizon_seconds=g.horizon_seconds
+                   WHERE g.run_id=? AND g.n>0 AND (?=0 OR (g.n>=10 AND (g.last_expensive_n=0 OR
+                     g.n>=MIN(g.last_expensive_n+10,CAST(CEIL(g.last_expensive_n*1.2) AS INTEGER)))))
+                   ORDER BY g.pattern_key,o.episode_ts""", (run_id, int(dirty_only)),
+            )
+            for row in value_rows:
+                grouped_values[row["pattern_key"]].append(float(row["return_value"]))
+        prior_rows = self.db.rows(
+            """SELECT entity_id,asset_key,horizon_seconds,AVG(return_value) prior FROM (
+                 SELECT DISTINCT entity_id,asset_key,horizon_seconds,episode_id,return_value
+                 FROM primary_analysis_observations WHERE run_id=?)
+               GROUP BY entity_id,asset_key,horizon_seconds""", (run_id,),
+        )
+        priors = {(r["entity_id"], r["asset_key"], r["horizon_seconds"]): float(r["prior"] or 0)
+                  for r in prior_rows}
         updates: list[dict[str, Any]] = []
         for aggregate in aggregates:
-            values = self.db.rows(
-                """SELECT return_value FROM primary_analysis_observations WHERE run_id=? AND entity_id=?
-                   AND pattern=? AND asset_key=? AND horizon_seconds=? ORDER BY episode_ts""",
-                (run_id, aggregate["entity_id"], aggregate["pattern"], aggregate["asset_key"], aggregate["horizon_seconds"]),
-            )
-            arr = np.asarray([row["return_value"] for row in values], dtype=float)
+            arr = np.asarray(grouped_values.get(aggregate["pattern_key"], []), dtype=float)
             if not len(arr):
                 continue
             low, high = bootstrap_ci(arr, samples=1000)
@@ -452,12 +535,7 @@ class IncrementalAnalyzer:
                     n=item["n"], ci_low=item["low"], ci_high=item["high"], qvalue=qvalue,
                     holdout_accuracy=item["accuracy"], train_mean=item["train_mean"], test_mean=item["test_mean"],
                 )
-                prior = conn.execute(
-                    """SELECT AVG(return_value) FROM (SELECT DISTINCT episode_id,return_value
-                       FROM primary_analysis_observations WHERE run_id=? AND entity_id=?
-                         AND asset_key=? AND horizon_seconds=?)""",
-                    (run_id, item["entity_id"], item["asset_key"], item["horizon_seconds"]),
-                ).fetchone()[0] or 0.0
+                prior = priors.get((item["entity_id"], item["asset_key"], item["horizon_seconds"]), 0.0)
                 shrunk = (item["n"] * item["mean_return"] + 20 * prior) / (item["n"] + 20)
                 conn.execute(
                     """UPDATE primary_pattern_aggregates SET median_return=?,ci_low=?,ci_high=?,sign_pvalue=?,
