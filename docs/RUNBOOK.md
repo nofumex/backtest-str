@@ -2,7 +2,7 @@
 
 ## 1. Unpack and use the existing `.env`
 
-`Settings.load()` searches the current directory and parent directories for `.env`, so the project can be unpacked under an existing working folder that already contains `API_HUB_KEY` and `FREE_LLM_API`.
+`Settings.load()` searches the current directory and parent directories for `.env`, so the project can be unpacked under an existing working folder that already contains `API_HUB_KEY`. `FREE_LLM_API` is optional and is not used by normal runs.
 
 ## 2. Install + offline validation
 

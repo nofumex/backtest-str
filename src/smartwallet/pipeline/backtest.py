@@ -60,6 +60,9 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
     # episode cannot accidentally receive extra prior weight.
     prior_cols = ["entity_id", "intent_label", "horizon_seconds", "asset_key"]
     prior_means = raw_df.groupby(prior_cols, dropna=False)["simple_return"].mean().to_dict()
+    primary_prior_means = raw_df.groupby(
+        ["entity_id", "horizon_seconds", "asset_key"], dropna=False,
+    )["simple_return"].mean().to_dict()
     global_mean = float(raw_df["simple_return"].mean())
 
     entity_pattern_rows: list[dict[str, Any]] = []
@@ -97,6 +100,10 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
         ("wallet_pattern_intent_asset", wallet_pattern_df, ["entity_id", "scope_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]),
     ]
     if has_patterns:
+        # ACTION is already represented by entity_action. Add every more-specific canonical
+        # pattern exactly once to the intent-independent primary layer.
+        non_action_patterns = entity_pattern_df[~entity_pattern_df["pattern"].str.startswith("ACTION:")]
+        group_specs.insert(1, ("entity_pattern", non_action_patterns, ["entity_id", "pattern", "horizon_seconds", "asset_key"]))
         group_specs.insert(1, ("entity_action_intent", broad_df, ["entity_id", "action", "intent_label", "horizon_seconds", "asset_key"]))
         group_specs.insert(2, ("entity_pattern_intent", entity_pattern_df, ["entity_id", "pattern", "intent_label", "horizon_seconds", "asset_key"]))
     results: list[dict[str, Any]] = []
@@ -129,8 +136,12 @@ def run_backtest(storage: Storage, *, min_n: int = 5, shrinkage_strength: float 
             key_map["asset_key"] = str(g["asset_key"].iloc[0])
         key_map["scope_type"] = "wallet" if level.startswith("wallet") else "entity"
         key_map["level"] = level
-        prior_key = (key_map["entity_id"], key_map["intent_label"], key_map["horizon_seconds"], key_map["asset_key"])
-        prior_mean = float(prior_means.get(prior_key, global_mean))
+        if "intent_label" in group_cols:
+            prior_key = (key_map["entity_id"], key_map["intent_label"], key_map["horizon_seconds"], key_map["asset_key"])
+            prior_mean = float(prior_means.get(prior_key, global_mean))
+        else:
+            primary_prior_key = (key_map["entity_id"], key_map["horizon_seconds"], key_map["asset_key"])
+            prior_mean = float(primary_prior_means.get(primary_prior_key, global_mean))
         shrunk = (len(vals) * float(np.mean(vals)) + shrinkage_strength * prior_mean) / (len(vals) + shrinkage_strength)
         results.append({
             **key_map,
@@ -182,7 +193,7 @@ def write_report(storage: Storage, run_id: str, frame: pd.DataFrame) -> dict[str
         display = display.sort_values(["n", "qvalue"], ascending=[False, True])
     html = "<html><head><meta charset='utf-8'><title>Smart-wallet backtest</title></head><body>"
     html += f"<h1>Smart-wallet behavior backtest</h1><p>run_id={run_id}</p>"
-    html += "<p>Rows are conditional historical estimates, not trading recommendations. qvalue is Benjamini-Hochberg adjusted; shrunk_mean uses an entity+intent+asset+horizon prior.</p>"
+    html += "<p>Rows are conditional historical estimates, not trading recommendations. qvalue is Benjamini-Hochberg adjusted; primary rows are intent-independent and secondary rows condition on intent.</p>"
     html += display.to_html(index=False, float_format=lambda x: f"{x:.6f}") if not display.empty else "<p>No groups met min_n.</p>"
     html += "</body></html>"
     html_path.write_text(html, encoding="utf-8")

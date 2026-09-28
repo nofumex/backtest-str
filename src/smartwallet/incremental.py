@@ -21,6 +21,11 @@ def pattern_key(entity: str, pattern: str, intent: str, asset: str, horizon: int
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def primary_pattern_key(entity: str, pattern: str, asset: str, horizon: int) -> str:
+    raw = json.dumps([entity, pattern, asset, int(horizon)], separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def maturity_for(*, n: int, ci_low: float | None, ci_high: float | None, qvalue: float | None,
                  holdout_accuracy: float | None, train_mean: float | None, test_mean: float | None) -> str:
     """Conservative, sample-aware display state; never a trading recommendation."""
@@ -69,6 +74,9 @@ class IncrementalAnalyzer:
         to_dt = datetime.fromisoformat(run["to_date"])
         to_ts = int(to_dt.replace(tzinfo=timezone.utc).timestamp()) + 86399
 
+        primary_inserted, primary_dirty = self._refresh_primary(
+            run_id, entities, from_ts, to_ts, batch_size,
+        )
         dirty = self._remove_stale(run_id)
         rows = self.db.rows(
             f"""SELECT e.episode_id,e.entity_id,e.start_ts,e.motif,e.evidence_json,e.intent_label,e.gross_usd,
@@ -125,7 +133,132 @@ class IncrementalAnalyzer:
         if expensive:
             self.refresh_expensive(run_id, dirty_only=False)
         self.db.update_run(run_id, analysis_updated_at=now_iso())
-        return {"observations": inserted, "patterns": len(dirty)}
+        return {
+            "observations": inserted,
+            "patterns": len(dirty),
+            "primary_observations": primary_inserted,
+            "primary_patterns": primary_dirty,
+        }
+
+    def _refresh_primary(
+        self, run_id: str, entities: list[str], from_ts: int, to_ts: int, batch_size: int,
+    ) -> tuple[int, int]:
+        """Increment the intent-independent entity+pattern+asset+horizon layer."""
+        stale = self.db.rows(
+            """SELECT o.observation_key,o.entity_id,o.pattern,o.asset_key,o.horizon_seconds
+               FROM primary_analysis_observations o LEFT JOIN episodes e ON e.episode_id=o.episode_id
+               WHERE o.run_id=? AND (e.episode_id IS NULL OR NOT EXISTS(
+                 SELECT 1 FROM run_episodes r WHERE r.run_id=o.run_id AND r.episode_id=o.episode_id
+               )) LIMIT 5000""", (run_id,),
+        )
+        dirty = {
+            primary_pattern_key(r["entity_id"], r["pattern"], r["asset_key"], r["horizon_seconds"])
+            for r in stale
+        }
+        if stale:
+            with self.db.connect() as conn:
+                conn.executemany(
+                    "DELETE FROM primary_analysis_observations WHERE run_id=? AND observation_key=?",
+                    [(run_id, row["observation_key"]) for row in stale],
+                )
+        placeholders = ",".join("?" for _ in entities)
+        rows = self.db.rows(
+            f"""SELECT e.episode_id,e.entity_id,e.start_ts,e.motif,e.evidence_json,e.gross_usd,
+                       m.asset_key,m.horizon_seconds,m.simple_return
+                FROM episodes e JOIN market_labels m ON m.episode_id=e.episode_id
+                WHERE e.entity_id IN ({placeholders}) AND e.start_ts BETWEEN ? AND ?
+                  AND e.episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?)
+                  AND m.simple_return IS NOT NULL
+                  AND NOT EXISTS(SELECT 1 FROM primary_analysis_observations o
+                    WHERE o.run_id=? AND o.episode_id=e.episode_id AND o.asset_key=m.asset_key
+                      AND o.horizon_seconds=m.horizon_seconds)
+                ORDER BY e.start_ts LIMIT ?""",
+            [*entities, from_ts, to_ts, run_id, run_id, batch_size],
+        )
+        inserted = 0
+        with self.db.connect() as conn:
+            for row in rows:
+                for pattern in _patterns(row["evidence_json"], row["motif"]):
+                    key = primary_pattern_key(row["entity_id"], pattern, row["asset_key"], row["horizon_seconds"])
+                    observation_key = hashlib.sha256(
+                        f'primary|{row["episode_id"]}|{row["asset_key"]}|{row["horizon_seconds"]}|{pattern}'.encode()
+                    ).hexdigest()
+                    before = conn.total_changes
+                    conn.execute(
+                        """INSERT OR IGNORE INTO primary_analysis_observations(run_id,observation_key,episode_id,
+                           entity_id,pattern,asset_key,horizon_seconds,episode_ts,return_value,gross_usd)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (run_id, observation_key, row["episode_id"], row["entity_id"], pattern,
+                         row["asset_key"], row["horizon_seconds"], row["start_ts"], row["simple_return"], row["gross_usd"]),
+                    )
+                    if conn.total_changes > before:
+                        inserted += 1
+                        dirty.add(key)
+                        conn.execute(
+                            """INSERT OR IGNORE INTO primary_pattern_aggregates(run_id,pattern_key,entity_id,pattern,
+                               asset_key,horizon_seconds,n,sum_return,sum_sq_return,negative_count,positive_count,
+                               mean_return,maturity,updated_at) VALUES(?,?,?,?,?,?,0,0,0,0,0,0,'EARLY',?)""",
+                            (run_id, key, row["entity_id"], pattern, row["asset_key"], row["horizon_seconds"], now_iso()),
+                        )
+            for key in dirty:
+                self._rebuild_primary_cheap(conn, run_id, key)
+        if dirty:
+            with self.db.connect() as conn:
+                family = conn.execute(
+                    "SELECT pattern_key,COALESCE(sign_pvalue,1.0) FROM primary_pattern_aggregates WHERE run_id=?",
+                    (run_id,),
+                ).fetchall()
+                qvalues = bh_qvalues([row[1] for row in family])
+                conn.executemany(
+                    "UPDATE primary_pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?",
+                    [(q, run_id, row[0]) for row, q in zip(family, qvalues)],
+                )
+        return inserted, len(dirty)
+
+    def _rebuild_primary_cheap(self, conn, run_id: str, key: str) -> None:
+        group = conn.execute(
+            "SELECT entity_id,pattern,asset_key,horizon_seconds FROM primary_pattern_aggregates WHERE run_id=? AND pattern_key=?",
+            (run_id, key),
+        ).fetchone()
+        if group is None:
+            return
+        entity, pattern, asset, horizon = group
+        sample = conn.execute(
+            """SELECT COUNT(*),SUM(return_value),SUM(return_value*return_value),
+                      SUM(return_value<0),SUM(return_value>0)
+               FROM primary_analysis_observations WHERE run_id=? AND entity_id=? AND pattern=?
+                 AND asset_key=? AND horizon_seconds=?""",
+            (run_id, entity, pattern, asset, horizon),
+        ).fetchone()
+        n, total, total_sq, neg, pos = sample
+        if not n:
+            conn.execute("DELETE FROM primary_pattern_aggregates WHERE run_id=? AND pattern_key=?", (run_id, key))
+            return
+        previous = conn.execute(
+            "SELECT n,maturity,negative_count FROM primary_pattern_aggregates WHERE run_id=? AND pattern_key=?",
+            (run_id, key),
+        ).fetchone()
+        old_n = int(previous[0]) if previous else 0
+        maturity = "EARLY" if n < 20 else (previous[1] if previous and previous[1] != "EARLY" else "PROMISING")
+        conn.execute(
+            """UPDATE primary_pattern_aggregates SET n=?,sum_return=?,sum_sq_return=?,negative_count=?,
+               positive_count=?,mean_return=?,maturity=?,updated_at=? WHERE run_id=? AND pattern_key=?""",
+            (n, total, total_sq, neg, pos, total / n, maturity, now_iso(), run_id, key),
+        )
+        for mark in CHECKPOINTS:
+            if old_n < mark <= n:
+                values = [float(row[0]) for row in conn.execute(
+                    """SELECT return_value FROM primary_analysis_observations WHERE run_id=? AND entity_id=?
+                       AND pattern=? AND asset_key=? AND horizon_seconds=? ORDER BY episode_ts LIMIT ?""",
+                    (run_id, entity, pattern, asset, horizon, mark),
+                )]
+                low, high = bootstrap_ci(np.asarray(values), samples=500)
+                conn.execute(
+                    """INSERT OR IGNORE INTO primary_pattern_checkpoints(run_id,pattern_key,n,negative_rate,
+                       mean_return,ci_low,ci_high,maturity,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (run_id, key, mark, sum(v < 0 for v in values) / mark, float(np.mean(values)), low, high,
+                     "EARLY" if mark < 20 else "PROMISING", now_iso()),
+                )
 
     def _remove_stale(self, run_id: str) -> set[str]:
         stale = self.db.rows(
@@ -209,6 +342,7 @@ class IncrementalAnalyzer:
                 )
 
     def refresh_expensive(self, run_id: str, *, dirty_only: bool = True) -> int:
+        self._refresh_primary_expensive(run_id, dirty_only=dirty_only)
         aggregates = self.db.rows(
             """SELECT * FROM pattern_aggregates WHERE run_id=? AND n>0
                AND (?=0 OR (n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10, CAST(CEIL(last_expensive_n*1.2) AS INTEGER))))) ORDER BY n DESC""",
@@ -271,4 +405,70 @@ class IncrementalAnalyzer:
             train_mean = ((row["mean_return"]*row["n"]-(row["test_mean_return"] or 0)*(row["test_n"] or 0))/row["train_n"]) if row["train_n"] else None
             maturity = maturity_for(n=row["n"],ci_low=row["ci_low"],ci_high=row["ci_high"],qvalue=row["qvalue"],holdout_accuracy=row["holdout_accuracy"],train_mean=train_mean,test_mean=row["test_mean_return"])
             self.db.execute("UPDATE pattern_aggregates SET maturity=? WHERE run_id=? AND pattern_key=?", (maturity,run_id,row["pattern_key"]))
+        return len(updates)
+
+    def _refresh_primary_expensive(self, run_id: str, *, dirty_only: bool = True) -> int:
+        aggregates = self.db.rows(
+            """SELECT * FROM primary_pattern_aggregates WHERE run_id=? AND n>0
+               AND (?=0 OR (n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10,
+               CAST(CEIL(last_expensive_n*1.2) AS INTEGER))))) ORDER BY n DESC""",
+            (run_id, int(dirty_only)),
+        )
+        updates: list[dict[str, Any]] = []
+        for aggregate in aggregates:
+            values = self.db.rows(
+                """SELECT return_value FROM primary_analysis_observations WHERE run_id=? AND entity_id=?
+                   AND pattern=? AND asset_key=? AND horizon_seconds=? ORDER BY episode_ts""",
+                (run_id, aggregate["entity_id"], aggregate["pattern"], aggregate["asset_key"], aggregate["horizon_seconds"]),
+            )
+            arr = np.asarray([row["return_value"] for row in values], dtype=float)
+            if not len(arr):
+                continue
+            low, high = bootstrap_ci(arr, samples=1000)
+            effective = int(np.sum(arr != 0))
+            neg = int(np.sum(arr < 0))
+            pvalue = float(binomtest(min(neg, effective - neg), n=effective, p=0.5).pvalue) if effective else 1.0
+            split = max(1, int(len(arr) * 0.7))
+            train, test = arr[:split], arr[split:]
+            train_mean = float(np.mean(train))
+            test_mean = float(np.mean(test)) if len(test) else None
+            direction = -1 if train_mean < 0 else 1
+            accuracy = float(np.mean(np.sign(test) == direction)) if len(test) else None
+            updates.append({
+                **aggregate, "median": float(np.median(arr)), "low": low, "high": high, "p": pvalue,
+                "train_n": len(train), "test_n": len(test), "train_mean": train_mean,
+                "test_mean": test_mean, "accuracy": accuracy,
+            })
+        family = {
+            row["pattern_key"]: row["sign_pvalue"] if row["sign_pvalue"] is not None else 1.0
+            for row in self.db.rows("SELECT pattern_key,sign_pvalue FROM primary_pattern_aggregates WHERE run_id=?", (run_id,))
+        }
+        family.update({item["pattern_key"]: item["p"] for item in updates})
+        qmap = dict(zip(family, bh_qvalues(list(family.values()))))
+        with self.db.connect() as conn:
+            for item in updates:
+                qvalue = qmap[item["pattern_key"]]
+                maturity = maturity_for(
+                    n=item["n"], ci_low=item["low"], ci_high=item["high"], qvalue=qvalue,
+                    holdout_accuracy=item["accuracy"], train_mean=item["train_mean"], test_mean=item["test_mean"],
+                )
+                prior = conn.execute(
+                    """SELECT AVG(return_value) FROM (SELECT DISTINCT episode_id,return_value
+                       FROM primary_analysis_observations WHERE run_id=? AND entity_id=?
+                         AND asset_key=? AND horizon_seconds=?)""",
+                    (run_id, item["entity_id"], item["asset_key"], item["horizon_seconds"]),
+                ).fetchone()[0] or 0.0
+                shrunk = (item["n"] * item["mean_return"] + 20 * prior) / (item["n"] + 20)
+                conn.execute(
+                    """UPDATE primary_pattern_aggregates SET median_return=?,ci_low=?,ci_high=?,sign_pvalue=?,
+                       qvalue=?,shrunk_mean=?,train_n=?,test_n=?,test_mean_return=?,holdout_accuracy=?,maturity=?,
+                       last_expensive_n=?,updated_at=? WHERE run_id=? AND pattern_key=?""",
+                    (item["median"], item["low"], item["high"], item["p"], qvalue, shrunk,
+                     item["train_n"], item["test_n"], item["test_mean"], item["accuracy"], maturity,
+                     item["n"], now_iso(), run_id, item["pattern_key"]),
+                )
+            conn.executemany(
+                "UPDATE primary_pattern_aggregates SET qvalue=? WHERE run_id=? AND pattern_key=?",
+                [(q, run_id, key) for key, q in qmap.items()],
+            )
         return len(updates)

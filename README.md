@@ -1,17 +1,17 @@
 # Smartwallet Research Terminal
 
-Live, restart-safe research and backtesting for institutional smart wallets. The browser controls historical collection, episode construction, LLM intent classification, market labeling and incremental statistical analysis.
+Live, restart-safe research and backtesting for institutional smart wallets. The browser controls historical collection, deterministic intent classification, market labeling and incremental statistical analysis.
 
 ## Run it
 
-Requirements: Python 3.11+, Node.js 20+ and the credentials below in `.env`:
+Requirements: Python 3.11+, Node.js 20+ and the API Hub credential below in `.env`:
 
 ```dotenv
 API_HUB_KEY=...
-FREE_LLM_API=...
-FREE_LLM_BASE_URL=http://159.194.241.69:3001/v1
-FREE_LLM_MODEL=llama-3.3-70b-versatile
 ```
+
+`FREE_LLM_*` is optional and used only by explicitly requested, non-blocking enrichment.
+Normal and full historical runs make no LLM calls.
 
 Development Р Р†Р вЂљРІР‚Сњ one command after install:
 
@@ -46,7 +46,7 @@ Open **http://SERVER_IP:8000**. FastAPI serves the built frontend and owns all b
 
 ## Incremental architecture
 
-The application remains a single FastAPI process with asyncio background tasks. Existing provider, normalizer, episode, LLM and market-labeling functions are reused; the web layer does not implement a second research pipeline.
+The application remains a single FastAPI process with asyncio background tasks. Existing provider, normalizer, episode and market-labeling functions are reused; the web layer does not implement a second research pipeline.
 
 SQLite stays in WAL mode. Web/run tables live beside the existing research tables:
 
@@ -55,7 +55,7 @@ provider backfill Р Р†РІР‚В РІР‚в„ў normalized wallet_event
                          Р Р†РІР‚В РІР‚Сљ new rowid watermark per entity/run
               dirty time-window episode rebuild
                          Р Р†РІР‚В РІР‚Сљ only unclassified episodes
-                 LLM intent classification
+           local deterministic intent classification
                          Р Р†РІР‚В РІР‚Сљ only incomplete episodes
                    future market labels
                          Р Р†РІР‚В РІР‚Сљ deduplicated run observations
@@ -98,7 +98,7 @@ npm test
 npm run build
 ```
 
-Authenticated throughput and full-history duration depend on provider limits, selected entities, cache warmth and VPS resources. They cannot be benchmarked honestly without spending the configured API/LLM credentials; the live terminal reports the actual rates for each run.
+Authenticated collection throughput and full-history duration depend on provider limits, selected entities, cache warmth and VPS resources. Intent classification is local CPU-only and the live terminal reports its measured episodes/second.
 
 More details: [architecture](docs/ARCHITECTURE.md), [provider contract](docs/HUB_CONTRACT.md), [limitations](docs/LIMITATIONS.md), and [validation](docs/VALIDATION.md).
 
@@ -160,11 +160,11 @@ backoff with jitter; non-transient 4xx stop immediately. `SMARTWALLET_HTTP_RETRI
 (default 4, capped at 8), `SMARTWALLET_PROVIDER_RPS` (default 4 per provider), and
 `SMARTWALLET_WALLET_TIMEOUT` (default 600 seconds) bound collection. Worker slots
 advance independently; one failed wallet does not hold the next batch behind it.
-LLM jobs have three pipeline attempts; price horizons preserve individual successes
+Optional LLM enrichment is outside the normal pipeline. Price horizons preserve individual successes
 and exhaust after three failed labeling passes. Future horizons remain pending
 until their timestamps arrive. Completed collection is not completed analysis.
 
-Cheap statistics run every five seconds in a worker thread, independently of slow LLM and market requests. Expensive tests refresh when n grows by
+Cheap primary statistics run every five seconds in a worker thread and do not depend on intent. Expensive tests refresh when n grows by
 10 or 20%, with a full refresh at completion or via the Refresh statistics button (POST `/api/runs/{run_id}/analysis/refresh`). Active workers pick up manual requests at their next processing boundary. BH uses the complete run hypothesis family and saved p-values;
 untested hypotheses conservatively participate with p=1. Sample filters default
 to n>=3; pagination serves 24 patterns. Confidence-aware ranking uses sample

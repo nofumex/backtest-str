@@ -8,7 +8,7 @@ Build a behavioral memory for each tracked institutional entity and each confirm
 2. **inferred economic intent**;
 3. **future market outcome**.
 
-Future market outcomes are never sent to the LLM classifier.
+Future market outcomes are never inputs to deterministic intent classification.
 
 ## Data flow
 
@@ -47,7 +47,7 @@ Confirmed wallet set
               fixed time window + confirmed own-wallet links
                               │
                               ▼
-                   FREE_LLM intent classifier
+             local deterministic intent classifier
                               │
                               ▼
         DefiLlama pre-event regime + future price labels
@@ -81,7 +81,7 @@ The project deliberately does **not** treat transaction counterparties as owned 
 - `TRANSFER_IN`
 - `ASSET_EXCHANGE_LIKE`
 
-It never converts a CEX deposit directly into `SELL`. The LLM receives a sequence of factual evidence and outputs a probability distribution across intent labels.
+The episode classifier combines these actions with sends/receives, stablecoin direction, confirmed own-wallet links, bridge/transaction enrichment and pre-event context. It emits a conservative label, confidence, deterministic reasons and the structured features used. Ambiguous evidence is `unknown`.
 
 ## Episode graph
 
@@ -89,14 +89,16 @@ Events from one wallet are grouped inside a fixed maximum episode window. Contin
 
 ## Leakage controls
 
-- LLM classification happens before market labeling.
-- LLM input contains only episode evidence and entity-history points at or before episode start.
+- Deterministic classification uses only episode evidence and entity/wallet history at or before episode start.
+- Market labeling is independent of intent and may proceed without any external semantic service.
 - Market returns are written to a separate table after classification.
 - Backtest split is chronological 70/30 for the simple direction validation.
 
 ## Statistical output
 
-For each entity-scope and individual-wallet-scope `(pattern, intent, horizon, asset)` group with sufficient observations:
+The primary layer is `(entity, pattern, asset, horizon)` and never depends on intent. The secondary layer is `(entity, pattern, intent, asset, horizon)`. Existing wallet-scope outputs remain available for compatibility.
+
+For each group with sufficient observations:
 
 - N;
 - mean / median return;
@@ -129,8 +131,8 @@ An episode contributes to several nested hypotheses instead of only one exact lo
 - `FULL:` — complete sequence when the episode has at most six events;
 - `REGIME:<risk_on|neutral|risk_off>|...` — the same hypothesis conditioned on pre-event BTC regime.
 
-The statistical estimator shrinks thin groups toward the matching `entity + intent + asset + horizon` prior. Wallet scope therefore inherits information from its parent entity rather than pretending five observations are a stable standalone distribution.
+The primary statistical estimator shrinks thin groups toward the matching `entity + asset + horizon` prior. The secondary layer may additionally condition on intent.
 
 ## Pre-event market regime
 
-Only documented DefiLlama historical price calls are needed. BTC/ETH are sampled at `t-24h, t-18h, t-12h, t-6h, t`; the system stores 24h return and a 6h-step log-return volatility proxy. Future prices are requested only after LLM intent classification.
+Only documented DefiLlama historical price calls are needed. BTC/ETH are sampled at `t-24h, t-18h, t-12h, t-6h, t`; the system stores 24h return and a 6h-step log-return volatility proxy. Future prices are requested independently of intent.

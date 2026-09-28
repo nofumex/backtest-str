@@ -19,8 +19,8 @@ class ProgressDashboard:
     completed: int = 0
     total: int = 0
     api_metrics: dict[str, int] = field(default_factory=dict)
-    llm_done: int = 0
-    llm_total: int = 0
+    classification_done: int = 0
+    classification_total: int = 0
     label_success: int = 0
     label_failed: int = 0
     stage_started: float = field(default_factory=time.monotonic)
@@ -44,7 +44,8 @@ class ProgressDashboard:
             self.stage_started = time.monotonic()
         self.completed, self.total = completed, total
         self.api_metrics.update(metrics.get("api_metrics", {}))
-        self.llm_done, self.llm_total = metrics.get("llm_done", self.llm_done), metrics.get("llm_total", self.llm_total)
+        self.classification_done = metrics.get("classification_done", self.classification_done)
+        self.classification_total = metrics.get("classification_total", self.classification_total)
         self.label_success, self.label_failed = metrics.get("label_success", self.label_success), metrics.get("label_failed", self.label_failed)
         now = time.monotonic()
         if self._live and now - self._last_render >= 0.2:

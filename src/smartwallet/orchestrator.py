@@ -114,7 +114,12 @@ class RunOrchestrator:
             for key,column in (("requests","api_requests"),("success","api_success"),("cache_hit","cache_hits"),("retry","retries"),("failed","failed")):
                 if column in saved:
                     rt.hub.metrics[key] = saved[column]
-            self.runtime_metrics[run_id] = {"started_monotonic": started, "hub": rt.hub.metrics, "llm_completed": saved.get("llm_completed",0)}
+            self.runtime_metrics[run_id] = {
+                "started_monotonic": started,
+                "hub": rt.hub.metrics,
+                "classification_completed": saved.get("deterministic_completed", saved.get("llm_completed", 0)),
+                "classification_seconds": saved.get("classification_seconds", 0.0),
+            }
             self.db.update_run(run_id, status="running", stage="discovery", started_at=run.get("started_at") or now_iso(), error=None)
             await self._discover(rt, run)
             analytics = asyncio.create_task(self._analysis_loop(run_id,analytics_stop))
@@ -123,7 +128,7 @@ class RunOrchestrator:
             self._draining.add(run_id)
             self._wakeups[run_id].set()
             await processor
-            self.db.update_run(run_id, stage="draining", current_work="Finishing classification, labels and statistics")
+            self.db.update_run(run_id, stage="draining", current_work="Finishing deterministic classification, labels and statistics")
             while True:
                 await self._checkpoint(run_id)
                 pending = await self._process_once(rt, run_id, final=True)
@@ -140,7 +145,6 @@ class RunOrchestrator:
             self._refresh_counts(run_id)
             self._persist_metrics(run_id, rt)
             failures = self.db.row("SELECT COUNT(*) n FROM run_wallets WHERE run_id=? AND status IN ('partial','failed')", (run_id,))["n"]
-            failures += self.db.row("SELECT COUNT(*) n FROM classification_jobs WHERE run_id=? AND attempts>=3 AND error IS NOT NULL", (run_id,))["n"]
             self.db.update_run(run_id, status="completed", desired_status="completed", stage="completed",
                                current_work="Analysis complete" + (f"; {failures} failed/partial items; inspect Data Quality" if failures else ""), progress=1.0, finished_at=now_iso())
         except SafeStop:
@@ -309,16 +313,15 @@ class RunOrchestrator:
                 await asyncio.to_thread(build_episodes, rt.storage, entity_id, rt.settings.episode_gap_seconds,
                     rt.settings.max_episode_events, start_ts=from_ts, end_ts=to_ts, run_id=run_id)
 
-        llm_limit = 100 if final else 20
-        if not rt.settings.llm_api_key:
-            raise RuntimeError("FREE_LLM_API is required before episode classification can continue")
         for entity_id in run["entities"]:
             request_context.set((entity_id,None))
-            llm_concurrency = max(1, min(16, int(run["settings"].get("llm_concurrency", 4))))
-            completed = await classify_episodes(rt.storage, rt.llm, entity_id, concurrency=min(llm_concurrency, rt.settings.concurrency),
-                                                start_ts=from_ts, end_ts=to_ts, limit=llm_limit, run_id=run_id)
+            classification_started = time.perf_counter()
+            completed = await classify_episodes(
+                rt.storage, None, entity_id, start_ts=from_ts, end_ts=to_ts, run_id=run_id,
+            )
             if run_id in self.runtime_metrics:
-                self.runtime_metrics[run_id]["llm_completed"] += completed
+                self.runtime_metrics[run_id]["classification_completed"] += completed
+                self.runtime_metrics[run_id]["classification_seconds"] += time.perf_counter() - classification_started
 
         episodes = rt.storage.fetchall(
             """SELECT e.* FROM episodes e JOIN run_episodes r USING(episode_id) WHERE r.run_id=?
@@ -339,7 +342,7 @@ class RunOrchestrator:
         return sum(queues.values())
 
     async def _analysis_loop(self, run_id: str, stop: asyncio.Event) -> None:
-        """Cheap ingestion is independent of slow classification and price requests."""
+        """Primary analysis is independent of intent and slow price requests."""
         while not stop.is_set():
             run = self.db.run(run_id)
             if run and run["desired_status"] == "running":
@@ -356,14 +359,18 @@ class RunOrchestrator:
     def queue_counts(self, run_id: str) -> dict[str, int]:
         run = self.db.run(run_id)
         if not run:
-            return {"episode_builder": 0, "llm_classification": 0, "market_labeling": 0, "analysis": 0}
+            return {"episode_builder": 0, "intent_classification": 0, "market_labeling": 0, "analysis": 0}
         def count(sql):
             return int(self.db.row(sql, (run_id,))["n"])
+        missing_primary = count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) JOIN market_labels m USING(episode_id) WHERE r.run_id=? AND m.simple_return IS NOT NULL AND NOT EXISTS(SELECT 1 FROM primary_analysis_observations o WHERE o.run_id=r.run_id AND o.episode_id=e.episode_id AND o.asset_key=m.asset_key AND o.horizon_seconds=m.horizon_seconds)")
+        # A completed pre-upgrade run remains quiescent/readable until explicitly refreshed.
+        if run.get("status") == "completed" and not count("SELECT COUNT(*) n FROM primary_analysis_observations WHERE run_id=?") and count("SELECT COUNT(*) n FROM analysis_observations WHERE run_id=?"):
+            missing_primary = 0
         return {
             "episode_builder": count("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=0"),
-            "llm_classification": count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NULL AND NOT EXISTS(SELECT 1 FROM classification_jobs j WHERE j.run_id=r.run_id AND j.episode_id=e.episode_id AND j.attempts>=3)"),
+            "intent_classification": count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NULL"),
             "market_labeling": count("SELECT COUNT(*) n FROM run_episodes r JOIN market_horizons h USING(episode_id) WHERE r.run_id=? AND h.state IN ('pending','retryable failure')"),
-            "analysis": count("SELECT COUNT(*) n FROM pattern_aggregates WHERE run_id=? AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id) AND n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10,CAST(CEIL(last_expensive_n*1.2) AS INTEGER)))") + count("SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id) JOIN market_labels m USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NOT NULL AND m.simple_return IS NOT NULL AND NOT EXISTS(SELECT 1 FROM analysis_observations o WHERE o.run_id=r.run_id AND o.episode_id=e.episode_id AND o.asset_key=m.asset_key AND o.horizon_seconds=m.horizon_seconds)")}
+            "analysis": count("SELECT COUNT(*) n FROM pattern_aggregates WHERE run_id=? AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id) AND n>=10 AND (last_expensive_n=0 OR n>=MIN(last_expensive_n+10,CAST(CEIL(last_expensive_n*1.2) AS INTEGER)))") + missing_primary}
 
     def _refresh_counts(self, run_id: str) -> None:
         run = self.db.run(run_id)
@@ -377,17 +384,23 @@ class RunOrchestrator:
                 episodes = db.execute("SELECT COUNT(*),SUM(intent_label IS NOT NULL) FROM episodes WHERE entity_id=? AND episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?)", (entity_id, run_id)).fetchone()
                 labels = db.execute("SELECT COUNT(*) FROM (SELECT m.episode_id,m.asset_key,m.horizon_seconds FROM market_labels m JOIN episodes e ON e.episode_id=m.episode_id WHERE e.entity_id=? AND m.simple_return IS NOT NULL AND e.episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?) GROUP BY m.episode_id,m.asset_key,m.horizon_seconds)", (entity_id, run_id)).fetchone()[0]
                 usable = db.execute("""SELECT COUNT(*) FROM (
-                  SELECT 1 FROM analysis_observations o WHERE run_id=? AND entity_id=?
+                  SELECT 1 FROM primary_analysis_observations o WHERE run_id=? AND entity_id=?
                   AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=o.run_id AND r.episode_id=o.episode_id)
                   GROUP BY episode_id,asset_key,horizon_seconds
                 )""", (run_id, entity_id)).fetchone()[0]
+                if not usable:
+                    usable = db.execute("""SELECT COUNT(*) FROM (
+                      SELECT 1 FROM analysis_observations o WHERE run_id=? AND entity_id=?
+                      AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=o.run_id AND r.episode_id=o.episode_id)
+                      GROUP BY episode_id,asset_key,horizon_seconds
+                    )""", (run_id, entity_id)).fetchone()[0]
                 db.execute("""UPDATE run_entities SET wallets_total=?,wallets_processed=?,wallets_failed=?,wallets_partial=?,events=?,episodes=?,classified=?,market_labels=?,usable_observations=?,updated_at=? WHERE run_id=? AND entity_id=?""",
                            (wallet[0] or 0, wallet[1] or 0, wallet[2] or 0, wallet[3] or 0, events, episodes[0] or 0, episodes[1] or 0, labels, usable, now_iso(), run_id, entity_id))
             totals = db.execute("SELECT COALESCE(SUM(wallets_total),0),COALESCE(SUM(wallets_processed+wallets_failed+wallets_partial),0) FROM run_entities WHERE run_id=?", (run_id,)).fetchone()
             counts = db.execute("SELECT COALESCE(SUM(events),0),COALESCE(SUM(episodes),0),COALESCE(SUM(classified),0),COALESCE(SUM(usable_observations),0) FROM run_entities WHERE run_id=?",(run_id,)).fetchone()
             built = db.execute("SELECT COUNT(*) FROM run_events WHERE run_id=? AND built=1",(run_id,)).fetchone()[0]
             market = db.execute("SELECT COUNT(*),COALESCE(SUM(state IN ('success','permanently unavailable')),0) FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=?",(run_id,)).fetchone()
-            labeled = db.execute("SELECT COUNT(*) FROM market_labels m JOIN run_episodes r USING(episode_id) JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.intent_label IS NOT NULL AND m.simple_return IS NOT NULL",(run_id,)).fetchone()[0]
+            labeled = db.execute("SELECT COUNT(*) FROM market_labels m JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND m.simple_return IS NOT NULL",(run_id,)).fetchone()[0]
             collection = min(1,totals[1]/totals[0]) if totals[0] else 0
             fractions = (built/max(1,counts[0]),counts[2]/max(1,counts[1]),market[1]/max(1,market[0]),counts[3]/max(1,labeled))
             progress = .05 + .45*collection + .1*sum(min(1,f) for f in fractions)
@@ -399,7 +412,8 @@ class RunOrchestrator:
         if metrics:
             elapsed = max(1.0, time.monotonic() - metrics.get("started_monotonic", time.monotonic()))
             hub = dict(metrics.get("hub") or {})
-            llm_completed = metrics.get("llm_completed", 0)
+            classification_completed = metrics.get("classification_completed", 0)
+            classification_seconds = metrics.get("classification_seconds", 0.0)
         else:
             started = datetime.fromisoformat(run["started_at"]) if run.get("started_at") else datetime.now(timezone.utc)
             ended = datetime.fromisoformat(run["finished_at"]) if run.get("finished_at") else datetime.now(timezone.utc)
@@ -407,7 +421,8 @@ class RunOrchestrator:
             saved = self.db.row("SELECT * FROM run_metrics WHERE run_id=?", (run_id,)) or {}
             hub = {"requests": saved.get("api_requests", 0), "success": saved.get("api_success", 0),
                    "cache_hit": saved.get("cache_hits", 0), "retry": saved.get("retries", 0), "failed": saved.get("failed", 0)}
-            llm_completed = saved.get("llm_completed", 0)
+            classification_completed = saved.get("deterministic_completed", saved.get("llm_completed", 0))
+            classification_seconds = saved.get("classification_seconds", 0.0)
         totals = self.db.row("SELECT COALESCE(SUM(events),0) events,COALESCE(SUM(episodes),0) episodes,COALESCE(SUM(classified),0) classified,COALESCE(SUM(market_labels),0) labels,COALESCE(SUM(usable_observations),0) analyzed FROM run_entities WHERE run_id=?", (run_id,))
         totals["built_events"] = self.db.row("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=1",(run_id,))["n"]
         totals["market_done"] = self.db.row("SELECT COUNT(*) n FROM market_horizons h JOIN run_episodes r USING(episode_id) WHERE r.run_id=? AND state IN ('success','permanently unavailable')",(run_id,))["n"]
@@ -426,25 +441,34 @@ class RunOrchestrator:
         def eta(n,rate):
             return 0 if n==0 else int(math.ceil(n/rate)) if rate>0 else None
         remaining = max(0,wallets["total"]-totals["wallets"])
+        classification_queue = queues.get("intent_classification", queues.get("llm_classification", 0))
+        classification_rate = (classification_completed / classification_seconds) if classification_seconds > 0 else rates["classified"]
+        classification_eta = eta(classification_queue, classification_rate)
         etas = {"collection":eta(remaining,rates["wallets"]),
             "episode":eta(queues["episode_builder"],rates["built_events"]),
-            "llm":eta(queues["llm_classification"],rates["classified"]),
+            "classification":classification_eta,
             "market":eta(queues["market_labeling"],rates["market_done"]),
             "analysis":eta(queues["analysis"],rates["analyzed"])}
+        # Compatibility for callers supplying the legacy queue contract.
+        if "llm_classification" in queues and "intent_classification" not in queues:
+            etas["llm"] = etas.pop("classification")
         # Conservative sequential drain estimate. Unknown throughput is never shown as a short ETA.
         etas["total"] = sum(etas.values()) if all(v is not None for v in etas.values()) else None
         return {"api":hub,"events_per_minute":round(60*rates["events"],1),
             "wallets_per_hour":round(3600*rates["wallets"],1),"api_requests_per_second":round(rates["requests"],1),
-            "llm_jobs_per_second":round(rates["classified"],3),"eta":etas,"window_seconds":round(span)}
+            "intent_episodes_per_second":round(classification_rate,1),"eta":etas,"window_seconds":round(span)}
 
     def _persist_metrics(self, run_id: str, rt: Runtime) -> None:
         hub = rt.hub.metrics
-        llm_completed = self.runtime_metrics.get(run_id, {}).get("llm_completed", 0)
+        classification_completed = self.runtime_metrics.get(run_id, {}).get("classification_completed", 0)
+        classification_seconds = self.runtime_metrics.get(run_id, {}).get("classification_seconds", 0.0)
         self.db.execute(
-            """INSERT INTO run_metrics(run_id,api_requests,api_success,cache_hits,retries,failed,llm_completed,updated_at)
-               VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET api_requests=excluded.api_requests,
+            """INSERT INTO run_metrics(run_id,api_requests,api_success,cache_hits,retries,failed,llm_completed,
+               deterministic_completed,classification_seconds,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET api_requests=excluded.api_requests,
                api_success=excluded.api_success,cache_hits=excluded.cache_hits,retries=excluded.retries,
-               failed=excluded.failed,llm_completed=excluded.llm_completed,updated_at=excluded.updated_at""",
+               failed=excluded.failed,deterministic_completed=excluded.deterministic_completed,
+               classification_seconds=excluded.classification_seconds,updated_at=excluded.updated_at""",
             (run_id, hub.get("requests", 0), hub.get("success", 0), hub.get("cache_hit", 0), hub.get("retry", 0),
-             hub.get("failed", 0), llm_completed, now_iso()),
+             hub.get("failed", 0), 0, classification_completed, classification_seconds, now_iso()),
         )

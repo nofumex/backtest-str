@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     retries INTEGER NOT NULL DEFAULT 0,
     failed INTEGER NOT NULL DEFAULT 0,
     llm_completed INTEGER NOT NULL DEFAULT 0,
+    deterministic_completed INTEGER NOT NULL DEFAULT 0,
+    classification_seconds REAL NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 
@@ -151,6 +153,69 @@ CREATE TABLE IF NOT EXISTS pattern_aggregates (
     PRIMARY KEY(run_id, pattern_key)
 );
 CREATE INDEX IF NOT EXISTS idx_patterns_rank ON pattern_aggregates(run_id, maturity, n DESC);
+
+-- Primary hypotheses deliberately exclude intent. The legacy tables above remain the
+-- secondary entity+pattern+intent layer and preserve every existing run.
+CREATE TABLE IF NOT EXISTS primary_analysis_observations (
+    run_id TEXT NOT NULL,
+    observation_key TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    asset_key TEXT NOT NULL,
+    horizon_seconds INTEGER NOT NULL,
+    episode_ts INTEGER NOT NULL,
+    return_value REAL NOT NULL,
+    gross_usd REAL,
+    PRIMARY KEY(run_id, observation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_primary_obs_group ON primary_analysis_observations(
+    run_id, entity_id, pattern, asset_key, horizon_seconds, episode_ts
+);
+
+CREATE TABLE IF NOT EXISTS primary_pattern_aggregates (
+    run_id TEXT NOT NULL,
+    pattern_key TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    asset_key TEXT NOT NULL,
+    horizon_seconds INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    sum_return REAL NOT NULL,
+    sum_sq_return REAL NOT NULL,
+    negative_count INTEGER NOT NULL,
+    positive_count INTEGER NOT NULL,
+    mean_return REAL NOT NULL,
+    median_return REAL,
+    ci_low REAL,
+    ci_high REAL,
+    sign_pvalue REAL,
+    qvalue REAL,
+    shrunk_mean REAL,
+    train_n INTEGER,
+    test_n INTEGER,
+    test_mean_return REAL,
+    holdout_accuracy REAL,
+    maturity TEXT NOT NULL DEFAULT 'EARLY',
+    robust_n INTEGER NOT NULL DEFAULT 0,
+    last_expensive_n INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, pattern_key)
+);
+CREATE INDEX IF NOT EXISTS idx_primary_patterns_rank ON primary_pattern_aggregates(run_id, maturity, n DESC);
+
+CREATE TABLE IF NOT EXISTS primary_pattern_checkpoints (
+    run_id TEXT NOT NULL,
+    pattern_key TEXT NOT NULL,
+    n INTEGER NOT NULL,
+    negative_rate REAL NOT NULL,
+    mean_return REAL NOT NULL,
+    ci_low REAL,
+    ci_high REAL,
+    maturity TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, pattern_key, n)
+);
 
 CREATE TABLE IF NOT EXISTS pattern_checkpoints (
     run_id TEXT NOT NULL,

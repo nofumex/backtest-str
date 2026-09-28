@@ -58,6 +58,33 @@ def test_incremental_refresh_is_idempotent(tmp_path: Path):
     storage.close()
 
 
+def test_primary_statistics_do_not_depend_on_intent(tmp_path: Path):
+    cfg = settings(tmp_path)
+    storage = Storage(cfg)
+    web = WebDB(cfg.db_path)
+    run_id = web.create_run({
+        "entities": ["wintermute"], "from_date": "2024-01-01", "to_date": "2026-12-31",
+        "mode": "diagnostic", "settings": {},
+    }, {"wintermute": "Wintermute"})
+    storage.save_episode({
+        "episode_id": "intent-pending", "entity_id": "wintermute", "start_ts": 1735689600,
+        "end_ts": 1735689660, "wallets": ["0xabc"], "event_ids": ["event-1"],
+        "motif": "TRANSFER_IN", "primary_asset_key": "coingecko:ethereum", "gross_usd": 1000,
+        "evidence": {"patterns": ["ACTION:TRANSFER_IN"]},
+    })
+    storage.save_market_label({
+        "episode_id": "intent-pending", "asset_key": "coingecko:ethereum", "horizon_seconds": 3600,
+        "source": "test", "simple_return": .01, "payload": {},
+    })
+    web.execute("INSERT INTO run_episodes VALUES(?,?)", (run_id, "intent-pending"))
+    result = IncrementalAnalyzer(web).refresh(run_id)
+    assert result["primary_observations"] == 1
+    assert result["observations"] == 0
+    assert web.row("SELECT n FROM primary_pattern_aggregates WHERE run_id=?", (run_id,))["n"] == 1
+    assert web.row("SELECT COUNT(*) n FROM pattern_aggregates WHERE run_id=?", (run_id,))["n"] == 0
+    storage.close()
+
+
 def test_interrupted_run_and_wallet_are_resumable(tmp_path: Path):
     web = WebDB(tmp_path / "terminal.db")
     run_id = web.create_run({

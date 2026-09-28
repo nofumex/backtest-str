@@ -29,7 +29,6 @@ class RunSettings(BaseModel):
     max_pages: int | None = Field(None, ge=1, le=10000)
     concurrency: int = Field(8, ge=1, le=32)
     enrichment_threshold: float = Field(100000, ge=0)
-    llm_concurrency: int = Field(4, ge=1, le=16)
 
 
 class RunCreate(BaseModel):
@@ -137,11 +136,21 @@ def snapshot(run_id: str) -> dict[str, Any]:
     totals = {key: sum(int(row.get(key) or 0) for row in entities) for key in (
         "wallets_total", "wallets_processed", "wallets_failed", "wallets_partial", "events", "episodes", "classified", "market_labels", "usable_observations"
     )}
-    patterns = [_pattern_payload(row) for row in db.rows(
-        """SELECT * FROM pattern_aggregates WHERE run_id=? AND n>=3 AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id) ORDER BY
+    pattern_rows = db.rows(
+        """SELECT *, 'all intents' intent_label, 'primary' hypothesis_layer
+           FROM primary_pattern_aggregates WHERE run_id=? AND n>=3
+           AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=primary_pattern_aggregates.run_id) ORDER BY
            CASE maturity WHEN 'ROBUST' THEN 4 WHEN 'ESTABLISHING' THEN 3 WHEN 'PROMISING' THEN 2 ELSE 1 END DESC,
            n DESC,ABS(mean_return) DESC LIMIT 24""", (run_id,)
-    )]
+    )
+    has_primary = db.row("SELECT 1 present FROM primary_pattern_aggregates WHERE run_id=? LIMIT 1", (run_id,))
+    if not pattern_rows and not has_primary:  # Archived runs remain readable before an explicit refresh.
+        pattern_rows = db.rows(
+            """SELECT *, 'secondary' hypothesis_layer FROM pattern_aggregates WHERE run_id=? AND n>=3
+               AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id)
+               ORDER BY n DESC,ABS(mean_return) DESC LIMIT 24""", (run_id,)
+        )
+    patterns = [_pattern_payload(row) for row in pattern_rows]
     feed = db.rows("SELECT * FROM discovery_feed WHERE run_id=? ORDER BY id DESC LIMIT 30", (run_id,))
     errors = db.rows("SELECT * FROM run_errors WHERE run_id=? ORDER BY id DESC LIMIT 20", (run_id,))
     queues = orchestrator.queue_counts(run_id)
@@ -161,7 +170,7 @@ def snapshot(run_id: str) -> dict[str, Any]:
 @app.get("/api/config")
 def config():
     return {"entities": load_entities(), "today": date.today().isoformat(), "credentials": {
-        "api_hub": bool(os.getenv("API_HUB_KEY", "").strip()), "llm": bool(os.getenv("FREE_LLM_API", "").strip())
+        "api_hub": bool(os.getenv("API_HUB_KEY", "").strip())
     }}
 
 
@@ -228,22 +237,46 @@ async def stream(run_id: str, request: Request):
 
 @app.get("/api/runs/{run_id}/patterns/{pattern_id}")
 def pattern_detail(run_id: str, pattern_id: str):
-    pattern = db.row("SELECT * FROM pattern_aggregates WHERE run_id=? AND pattern_key=?", (run_id, pattern_id))
+    pattern = db.row(
+        "SELECT *, 'all intents' intent_label, 'primary' hypothesis_layer FROM primary_pattern_aggregates WHERE run_id=? AND pattern_key=?",
+        (run_id, pattern_id),
+    )
+    primary = bool(pattern)
+    if not pattern:
+        pattern = db.row(
+            "SELECT *, 'secondary' hypothesis_layer FROM pattern_aggregates WHERE run_id=? AND pattern_key=?",
+            (run_id, pattern_id),
+        )
     if not pattern:
         raise HTTPException(404, "Pattern not found")
-    observations = db.rows(
-        """SELECT o.*,e.motif FROM analysis_observations o JOIN episodes e ON e.episode_id=o.episode_id
-           WHERE o.run_id=? AND o.entity_id=? AND o.pattern=? AND o.intent_label=? AND o.asset_key=? AND o.horizon_seconds=?
-           ORDER BY o.episode_ts""",
-        (run_id, pattern["entity_id"], pattern["pattern"], pattern["intent_label"], pattern["asset_key"], pattern["horizon_seconds"]),
-    )
-    checkpoints = db.rows("SELECT * FROM pattern_checkpoints WHERE run_id=? AND pattern_key=? ORDER BY n", (run_id, pattern_id))
-    horizons = db.rows(
-        """SELECT horizon_seconds,COUNT(*) n,AVG(return_value) mean_return
-           FROM analysis_observations WHERE run_id=? AND entity_id=? AND pattern=? AND intent_label=? AND asset_key=?
-           GROUP BY horizon_seconds ORDER BY horizon_seconds""",
-        (run_id, pattern["entity_id"], pattern["pattern"], pattern["intent_label"], pattern["asset_key"]),
-    )
+    if primary:
+        observations = db.rows(
+            """SELECT o.*,e.motif FROM primary_analysis_observations o JOIN episodes e ON e.episode_id=o.episode_id
+               WHERE o.run_id=? AND o.entity_id=? AND o.pattern=? AND o.asset_key=? AND o.horizon_seconds=?
+               ORDER BY o.episode_ts""",
+            (run_id, pattern["entity_id"], pattern["pattern"], pattern["asset_key"], pattern["horizon_seconds"]),
+        )
+        checkpoints = db.rows("SELECT * FROM primary_pattern_checkpoints WHERE run_id=? AND pattern_key=? ORDER BY n", (run_id, pattern_id))
+        horizons = db.rows(
+            """SELECT horizon_seconds,COUNT(*) n,AVG(return_value) mean_return
+               FROM primary_analysis_observations WHERE run_id=? AND entity_id=? AND pattern=? AND asset_key=?
+               GROUP BY horizon_seconds ORDER BY horizon_seconds""",
+            (run_id, pattern["entity_id"], pattern["pattern"], pattern["asset_key"]),
+        )
+    else:
+        observations = db.rows(
+            """SELECT o.*,e.motif FROM analysis_observations o JOIN episodes e ON e.episode_id=o.episode_id
+               WHERE o.run_id=? AND o.entity_id=? AND o.pattern=? AND o.intent_label=? AND o.asset_key=? AND o.horizon_seconds=?
+               ORDER BY o.episode_ts""",
+            (run_id, pattern["entity_id"], pattern["pattern"], pattern["intent_label"], pattern["asset_key"], pattern["horizon_seconds"]),
+        )
+        checkpoints = db.rows("SELECT * FROM pattern_checkpoints WHERE run_id=? AND pattern_key=? ORDER BY n", (run_id, pattern_id))
+        horizons = db.rows(
+            """SELECT horizon_seconds,COUNT(*) n,AVG(return_value) mean_return
+               FROM analysis_observations WHERE run_id=? AND entity_id=? AND pattern=? AND intent_label=? AND asset_key=?
+               GROUP BY horizon_seconds ORDER BY horizon_seconds""",
+            (run_id, pattern["entity_id"], pattern["pattern"], pattern["intent_label"], pattern["asset_key"]),
+        )
     values = [float(row["return_value"]) for row in observations]
     histogram = []
     if values:
@@ -288,6 +321,12 @@ def quality(run_id: str):
         args = (run_id,eid)
         entity["unknown_assets"] = db.row("SELECT COUNT(*) n"+base+" AND COALESCE(target_asset_key,primary_asset_key) IS NULL",args)["n"]
         entity["unclassified"] = db.row("SELECT COUNT(*) n"+base+" AND intent_label IS NULL",args)["n"]
+        entity["unknown_intents"] = db.row("SELECT COUNT(*) n"+base+" AND intent_label='unknown'",args)["n"]
+        confidence = db.row("SELECT AVG(intent_confidence) value"+base+" AND intent_label IS NOT NULL",args)
+        entity["heuristic_confidence"] = confidence["value"]
+        entity["deterministic_classified"] = db.row(
+            "SELECT COUNT(*) n"+base+" AND json_extract(COALESCE(intent_json,'{}'),'$.classifier')='deterministic_intent'", args,
+        )["n"]
         horizons = db.row("SELECT SUM(h.state IN ('pending','retryable failure')) pending,SUM(h.state='permanently unavailable') unavailable FROM market_horizons h JOIN run_episodes r USING(episode_id) JOIN episodes e USING(episode_id) WHERE r.run_id=? AND e.entity_id=?",args)
         entity["missing_market"] = horizons["pending"] or 0
         entity["unavailable_market"] = horizons["unavailable"] or 0
@@ -308,8 +347,14 @@ def quality(run_id: str):
 
 @app.get("/api/runs/{run_id}/patterns")
 def patterns(run_id: str, min_n: int = 3, max_n: int = 0, entity: str = "", intent: str = "", kind: str = "", horizon: int = 0, search: str = "", sort: str = "best", offset: int = 0, limit: int = 24):
-    where, args = "run_id=? AND n>=? AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id=pattern_aggregates.run_id)", [run_id,max(1,min_n)]
-    for column,value in (("entity_id",entity),("intent_label",intent),("horizon_seconds",horizon)):
+    # The explorer defaults to the intent-independent primary layer. Supplying an intent
+    # explicitly switches to the secondary dimension without duplicating cards by default.
+    table = "pattern_aggregates" if intent else "primary_pattern_aggregates"
+    where, args = f"run_id=? AND n>=? AND EXISTS(SELECT 1 FROM run_episodes r WHERE r.run_id={table}.run_id)", [run_id,max(1,min_n)]
+    dimensions = [("entity_id", entity), ("horizon_seconds", horizon)]
+    if intent:
+        dimensions.append(("intent_label", intent))
+    for column,value in dimensions:
         if value:
             where += f" AND {column}=?"; args.append(value)
     if max_n:
@@ -317,13 +362,23 @@ def patterns(run_id: str, min_n: int = 3, max_n: int = 0, entity: str = "", inte
     if kind:
         where += " AND pattern LIKE ?"; args.append(kind+":%")
     if search:
-        where += " AND (pattern LIKE ? OR asset_key LIKE ? OR intent_label LIKE ? OR asset_key IN (SELECT asset_key FROM assets WHERE symbol LIKE ? OR name LIKE ?))"; args.extend(["%"+search+"%"]*5)
+        if intent:
+            where += " AND (pattern LIKE ? OR asset_key LIKE ? OR intent_label LIKE ? OR asset_key IN (SELECT asset_key FROM assets WHERE symbol LIKE ? OR name LIKE ?))"; args.extend(["%"+search+"%"]*5)
+        else:
+            where += " AND (pattern LIKE ? OR asset_key LIKE ? OR asset_key IN (SELECT asset_key FROM assets WHERE symbol LIKE ? OR name LIKE ?))"; args.extend(["%"+search+"%"]*4)
     orders = {"sample":"n DESC", "effect":"ABS(mean_return) DESC,n DESC", "hit":"MAX(negative_count,positive_count)*1.0/n DESC,n DESC", "newest":"updated_at DESC"}
     # Bounded effect, evidence strength and shrinkage by sample size.
     best = "(n*1.0/(n+20))*(1+MIN(ABS(COALESCE(shrunk_mean,mean_return)),1))*(1+COALESCE(holdout_accuracy,0))*(1+CASE WHEN qvalue<=0.05 THEN 1 ELSE 0 END) DESC,n DESC"
     order = orders.get(sort,best)
-    total = db.row("SELECT COUNT(*) n FROM pattern_aggregates WHERE "+where,args)["n"]
-    rows = db.rows("SELECT * FROM pattern_aggregates WHERE "+where+" ORDER BY "+order+" LIMIT ? OFFSET ?",[*args,min(100,max(1,limit)),max(0,offset)])
+    total = db.row(f"SELECT COUNT(*) n FROM {table} WHERE "+where,args)["n"]
+    select = "SELECT *, 'secondary' hypothesis_layer" if intent else "SELECT *, 'all intents' intent_label, 'primary' hypothesis_layer"
+    rows = db.rows(f"{select} FROM {table} WHERE "+where+" ORDER BY "+order+" LIMIT ? OFFSET ?",[*args,min(100,max(1,limit)),max(0,offset)])
+    has_primary = db.row("SELECT 1 present FROM primary_pattern_aggregates WHERE run_id=? LIMIT 1", (run_id,))
+    if not rows and not intent and not has_primary:
+        # Completed legacy runs are still browsable until the user requests a refresh.
+        legacy_where = where.replace("primary_pattern_aggregates", "pattern_aggregates")
+        total = db.row("SELECT COUNT(*) n FROM pattern_aggregates WHERE "+legacy_where,args)["n"]
+        rows = db.rows("SELECT *, 'secondary' hypothesis_layer FROM pattern_aggregates WHERE "+legacy_where+" ORDER BY "+order+" LIMIT ? OFFSET ?",[*args,min(100,max(1,limit)),max(0,offset)])
     return {"total":total,"items":[_pattern_payload(r) for r in rows]}
 
 

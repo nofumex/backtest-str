@@ -134,11 +134,18 @@ async def build_all_episodes(rt: Runtime, entity_config: str = "config/entities.
     return out
 
 
-async def classify_all(rt: Runtime, entity_config: str = "config/entities.yaml", *, classify_roles: bool = True, force: bool = False) -> dict[str, dict[str, int]]:
+async def classify_all(rt: Runtime, entity_config: str = "config/entities.yaml", *, classify_roles: bool = False, force: bool = False,
+                       llm_fallback: bool = False) -> dict[str, dict[str, int]]:
+    """Local deterministic episode classification.
+
+    Wallet-role and unknown-intent LLM enrichment remain explicit opt-ins and are never part
+    of a normal run.
+    """
     out = {}
     for e in load_entities(entity_config):
         roles = await classify_wallet_roles(rt.storage, rt.llm, e["id"], concurrency=min(4, rt.settings.concurrency), force=force) if classify_roles else 0
-        episodes = await classify_episodes(rt.storage, rt.llm, e["id"], force=force, concurrency=min(4, rt.settings.concurrency))
+        episodes = await classify_episodes(rt.storage, rt.llm, e["id"], force=force,
+                                           concurrency=min(4, rt.settings.concurrency), llm_fallback=llm_fallback)
         out[e["id"]] = {"roles": roles, "episodes": episodes}
     return out
 

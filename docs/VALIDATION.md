@@ -24,9 +24,10 @@ This project intentionally uses only the smaller **50-route** allowlist in `src/
 - Mock transport test that `X-Hub-Key` is a header and never part of the URL.
 - Pagination tests for documented DeBank `start_time` cursor behavior.
 - Episode leakage/bounding tests and hierarchical pattern tests.
-- LLM JSON/probability normalization tests.
+- deterministic intent rule, ambiguity, batch/no-network and legacy-preservation tests;
+- optional LLM JSON/probability normalization tests.
 - Market return and statistical backtest tests.
 
 ## What cannot be honestly validated inside the generated artifact
 
-The artifact does **not** contain the user's secrets, so a real authenticated end-to-end Hub run and a real FREE_LLM request cannot be executed during packaging. Run `smartwallet doctor --live` after placing/uncovering the existing `.env`. This is deliberately different from claiming that a mocked test proves upstream availability.
+The artifact does **not** contain the user's secrets, so a real authenticated end-to-end Hub run cannot be executed during packaging. Normal analysis does not require or call `FREE_LLM`; optional enrichment can be tested separately. Run `smartwallet doctor --live` after placing/uncovering the existing `.env`. This is deliberately different from claiming that a mocked test proves upstream availability.

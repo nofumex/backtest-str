@@ -29,3 +29,11 @@ def migrate(db):
         if "wallets_partial" not in columns:
             db.execute("ALTER TABLE run_entities ADD COLUMN wallets_partial INTEGER NOT NULL DEFAULT 0")
         db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(3)")
+
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='run_metrics'").fetchone():
+        columns = {r[1] for r in db.execute("PRAGMA table_info(run_metrics)")}
+        if "deterministic_completed" not in columns:
+            db.execute("ALTER TABLE run_metrics ADD COLUMN deterministic_completed INTEGER NOT NULL DEFAULT 0")
+        if "classification_seconds" not in columns:
+            db.execute("ALTER TABLE run_metrics ADD COLUMN classification_seconds REAL NOT NULL DEFAULT 0")
+        db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(4)")

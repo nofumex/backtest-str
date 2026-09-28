@@ -103,8 +103,14 @@ def episodes():
 
 
 @app.command()
-def classify(force: bool = typer.Option(False), roles: bool = typer.Option(True)):
-    _print(_run(_with_runtime(lambda rt: classify_all(rt, classify_roles=roles, force=force))))
+def classify(
+    force: bool = typer.Option(False),
+    roles: bool = typer.Option(False, help="Opt in to legacy LLM wallet-role enrichment"),
+    llm_fallback: bool = typer.Option(False, help="Opt in to non-blocking LLM enrichment for unknown intents"),
+):
+    _print(_run(_with_runtime(lambda rt: classify_all(
+        rt, classify_roles=roles, force=force, llm_fallback=llm_fallback,
+    ))))
 
 
 @app.command("label-market")
