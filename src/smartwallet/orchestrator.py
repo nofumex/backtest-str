@@ -147,7 +147,13 @@ class RunOrchestrator:
                 await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh, run_id, expensive=True)
             self._refresh_counts(run_id)
             self._persist_metrics(run_id, rt)
-            failures = self.db.row("SELECT COUNT(*) n FROM run_wallets WHERE run_id=? AND status IN ('partial','failed')", (run_id,))["n"]
+            wallet_failures = self.db.row(
+                "SELECT COUNT(*) n FROM run_wallets WHERE run_id=? AND status IN ('partial','failed')", (run_id,)
+            )["n"]
+            enrichment_failures = self.db.row(
+                "SELECT COUNT(*) n FROM deferred_jobs WHERE run_id=? AND state='failed'", (run_id,)
+            )["n"]
+            failures = int(wallet_failures or 0) + int(enrichment_failures or 0)
             self.db.update_run(run_id, status="completed", desired_status="completed", stage="completed",
                                current_work="Analysis complete" + (f"; {failures} failed/partial items; inspect Data Quality" if failures else ""), progress=1.0, finished_at=now_iso())
         except SafeStop:
@@ -265,6 +271,12 @@ class RunOrchestrator:
         cache_params = (row["entity_id"], address, parse_date(run["from_date"]), parse_date(run["to_date"])+86399, max_pages or 0)
         if self.db.row("SELECT 1 FROM wallet_collection_cache WHERE entity_id=? AND address=? AND from_ts=? AND to_ts=? AND max_pages=?", cache_params):
             self.db.execute("INSERT OR IGNORE INTO run_events(run_id,event_id) SELECT ?,event_id FROM wallet_events WHERE entity_id=? AND wallet=? AND ts BETWEEN ? AND ?", (run["run_id"],*cache_params[:4]))
+            if address.startswith("0x"):
+                self.db.execute(
+                    """INSERT OR IGNORE INTO deferred_jobs(run_id,kind,item_key,entity_id,payload_json,priority,updated_at)
+                       VALUES(?,'wallet_context',?,?,?,0,?)""",
+                    (run["run_id"], address.lower(), row["entity_id"], json.dumps({"address": address}), now_iso()),
+                )
             rt.hub.metrics["cache_hit"] += 1
             count = self.db.row("SELECT COUNT(*) n FROM wallet_events WHERE entity_id=? AND wallet=? AND ts BETWEEN ? AND ?", cache_params[:4])["n"]
             return {"events":count}
@@ -372,7 +384,7 @@ class RunOrchestrator:
 
     async def _analyze_once(self, rt: Runtime, run_id: str) -> int:
         async with self.analysis_locks.setdefault(run_id, asyncio.Lock()):
-            result = await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh, run_id, batch_size=2000)
+            result = await asyncio.to_thread(IncrementalAnalyzer(self.db).refresh, run_id, batch_size=20_000)
         return int(result.get("observations", 0)) + int(result.get("primary_observations", 0))
 
     async def _enrich_once(self, rt: Runtime, run_id: str) -> int:
@@ -394,8 +406,20 @@ class RunOrchestrator:
         try:
             payload = json.loads(job["payload_json"] or "{}")
             if job["kind"] == "wallet_context":
+                address = payload["address"].lower()
+                if not rt.storage.position_exists(job["entity_id"], address, "evm", "debank.portfolio_project_list"):
+                    positions = await rt.debank.positions(address)
+                    rt.storage.save_position(job["entity_id"], address, "evm",
+                                             "debank.portfolio_project_list", positions)
                 await snapshot_evm_wallet_context(rt.arkham, rt.oklink, rt.gecko, rt.storage,
-                                                  entity_id=job["entity_id"], address=payload["address"], max_tokens=3)
+                                                  entity_id=job["entity_id"], address=address, max_tokens=3)
+                # Historical wallet context is classification evidence. Rebuild only this
+                # wallet's run events; episode evidence hashing then invalidates secondary data.
+                self.db.execute(
+                    """UPDATE run_events SET built=0 WHERE run_id=? AND event_id IN
+                       (SELECT event_id FROM wallet_events WHERE entity_id=? AND wallet=?)""",
+                    (run_id, job["entity_id"], address),
+                )
             elif job["kind"] == "tx_enrichment":
                 event = rt.storage.fetchone("SELECT * FROM wallet_events WHERE event_id=?", (payload["event_id"],))
                 if event:
@@ -418,12 +442,16 @@ class RunOrchestrator:
                 (state, str(exc)[:500], 0 if state == "failed" else time.time() + 2**attempts,
                  now_iso(), run_id, job["kind"], job["item_key"]),
             )
+            if state == "failed":
+                self.db.add_error(run_id, "enrichment", str(exc), entity_id=job.get("entity_id"),
+                                  item=f"{job['kind']}:{job['item_key']}", retryable=False)
         return 1
 
     def _core_pending(self, run_id: str) -> int:
         now = time.time()
         queries = (
             ("SELECT COUNT(*) n FROM run_events WHERE run_id=? AND built=0", (run_id,)),
+            ("SELECT COUNT(*) n FROM deferred_jobs WHERE run_id=? AND state NOT IN ('complete','failed')", (run_id,)),
             ("""SELECT COUNT(*) n FROM run_episodes r JOIN episodes e USING(episode_id)
                 WHERE r.run_id=? AND e.intent_label IS NULL""", (run_id,)),
             ("""SELECT COUNT(*) n FROM run_episodes r JOIN market_horizons h USING(episode_id)

@@ -13,6 +13,7 @@ from typing import Any, Iterable
 from ..llm import FreeLLMClient
 from ..normalize import STABLE_TOKEN_IDS, asset_key
 from ..storage import Storage, canonical_json, utc_now_iso
+from ..incremental import record_analysis_invalidations
 
 
 CLASSIFIER_NAME = "deterministic_intent"
@@ -473,6 +474,7 @@ async def classify_episodes(
                 chunk = episode_ids[start:start + 400]
                 placeholders = ",".join("?" for _ in chunk)
                 if run_id:
+                    record_analysis_invalidations(db, run_id, chunk)
                     db.execute(f"DELETE FROM analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
                                [run_id, *chunk])
                 else:

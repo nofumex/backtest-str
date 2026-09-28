@@ -238,6 +238,13 @@ CREATE TABLE IF NOT EXISTS artifact_provenance (
     PRIMARY KEY(artifact_type,artifact_id)
 );
 
+CREATE TABLE IF NOT EXISTS analysis_invalidations (
+    run_id TEXT NOT NULL,
+    layer TEXT NOT NULL,
+    pattern_key TEXT NOT NULL,
+    PRIMARY KEY(run_id,layer,pattern_key)
+);
+
 CREATE TABLE IF NOT EXISTS market_snapshots (
     captured_at TEXT NOT NULL,
     source TEXT NOT NULL,

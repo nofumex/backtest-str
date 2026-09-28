@@ -9,6 +9,7 @@ from typing import Any
 from ..pipeline.entity_context import _nearest_at_or_before
 from ..storage import Storage
 from ..normalize import STABLE_TOKEN_IDS, asset_key
+from ..incremental import record_analysis_invalidations
 
 
 class DSU:
@@ -82,6 +83,7 @@ def behavior_patterns(rows: list[dict[str, Any]]) -> list[str]:
 
 
 EPISODE_BUILD_VERSION = "2.0-windowed-bulk-context"
+EPISODE_EVIDENCE_VERSION = "1.0-structured-context"
 
 
 def dirty_windows(storage: Storage, run_id: str, entity_id: str, gap_seconds: int,
@@ -322,6 +324,12 @@ def build_episodes(
         ep["episode_id"]: hashlib.sha256(json.dumps(ep["event_ids"], separators=(",", ":")).encode()).hexdigest()
         for ep in out
     }
+    evidence_inputs = {
+        ep["episode_id"]: hashlib.sha256(
+            json.dumps(ep["evidence"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        for ep in out
+    }
     previous = {}
     episode_ids = list(current_inputs)
     for offset in range(0, len(episode_ids), 400):
@@ -334,14 +342,47 @@ def build_episodes(
             previous[row["artifact_id"]] = (row["version"], row["input_hash"])
     changed = [episode_id for episode_id, input_hash in current_inputs.items()
                if previous.get(episode_id) != (EPISODE_BUILD_VERSION, input_hash)]
+    previous_evidence = {}
+    for offset in range(0, len(episode_ids), 400):
+        chunk = episode_ids[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in storage.fetchall(
+            f"""SELECT artifact_id,version,input_hash FROM artifact_provenance
+                WHERE artifact_type='episode_evidence' AND artifact_id IN ({placeholders})""", chunk,
+        ):
+            previous_evidence[row["artifact_id"]] = (row["version"], row["input_hash"])
+    evidence_changed = [episode_id for episode_id, input_hash in evidence_inputs.items()
+                        if previous_evidence.get(episode_id) != (EPISODE_EVIDENCE_VERSION, input_hash)]
+    obsolete = sorted(set(replaced) - set(episode_ids))
     storage.save_episodes(out, run_id=run_id, replace_episode_ids=replaced)
     with storage.conn() as db:
         if run_id:
+            for offset in range(0, len(obsolete), 400):
+                chunk = obsolete[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                record_analysis_invalidations(db, run_id, chunk)
+                db.execute(
+                    f"DELETE FROM primary_analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
+                    [run_id, *chunk],
+                )
+                db.execute(
+                    f"DELETE FROM analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
+                    [run_id, *chunk],
+                )
             for offset in range(0, len(changed), 400):
                 chunk = changed[offset:offset + 400]
                 placeholders = ",".join("?" for _ in chunk)
+                record_analysis_invalidations(db, run_id, chunk)
                 db.execute(
                     f"DELETE FROM primary_analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
+                    [run_id, *chunk],
+                )
+            for offset in range(0, len(evidence_changed), 400):
+                chunk = evidence_changed[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                record_analysis_invalidations(db, run_id, chunk)
+                db.execute(
+                    f"DELETE FROM analysis_observations WHERE run_id=? AND episode_id IN ({placeholders})",
                     [run_id, *chunk],
                 )
         db.executemany(
@@ -349,6 +390,13 @@ def build_episodes(
                VALUES('episode',?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(artifact_type,artifact_id) DO UPDATE SET
                version=excluded.version,input_hash=excluded.input_hash,updated_at=excluded.updated_at""",
             [(ep["episode_id"], EPISODE_BUILD_VERSION, current_inputs[ep["episode_id"]]) for ep in out],
+        )
+        db.executemany(
+            """INSERT INTO artifact_provenance(artifact_type,artifact_id,version,input_hash,updated_at)
+               VALUES('episode_evidence',?,?,?,CURRENT_TIMESTAMP)
+               ON CONFLICT(artifact_type,artifact_id) DO UPDATE SET version=excluded.version,
+               input_hash=excluded.input_hash,updated_at=excluded.updated_at""",
+            [(ep["episode_id"], EPISODE_EVIDENCE_VERSION, evidence_inputs[ep["episode_id"]]) for ep in out],
         )
     if run_id:
         with storage.conn() as db:

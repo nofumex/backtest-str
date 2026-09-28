@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 import tempfile
 import time
 from dataclasses import replace
@@ -45,7 +46,10 @@ def event(i: int, base: int):
 
 
 async def benchmark(count: int):
-    with tempfile.TemporaryDirectory(prefix="smartwallet-pipeline-") as root:
+    def progress(stage: str, started: float) -> None:
+        print(f"{stage}: {time.perf_counter() - started:.3f}s", file=sys.stderr, flush=True)
+
+    with tempfile.TemporaryDirectory(prefix="smartwallet-pipeline-", ignore_cleanup_errors=True) as root:
         base_settings = Settings.load()
         settings = replace(base_settings, db_path=Path(root) / "bench.sqlite", raw_dir=Path(root) / "raw",
                            report_dir=Path(root) / "reports")
@@ -62,21 +66,25 @@ async def benchmark(count: int):
         for offset in range(0, count, 1000):
             storage.save_events(event(i, base) for i in range(offset, min(count, offset + 1000)))
         timings["event_write_seconds"] = time.perf_counter() - started
+        progress("event write", started)
 
         started = time.perf_counter()
         episodes = build_episodes(storage, "bench", settings.episode_gap_seconds,
                                   settings.max_episode_events, start_ts=base, end_ts=base + count, run_id=run_id)
         timings["episode_build_seconds"] = time.perf_counter() - started
+        progress("episode build", started)
 
         started = time.perf_counter()
         classified = await classify_episodes(storage, None, "bench", run_id=run_id)
         timings["classification_seconds"] = time.perf_counter() - started
+        progress("classification", started)
 
         provider = BatchProvider()
         cold = await MarketLabeler(provider, storage).label_episodes(
             storage.fetchall("SELECT * FROM episodes WHERE episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?)", (run_id,)),
             DEFAULT_HORIZONS, concurrency=8,
         )
+        print(f"market cold: {cold.get('elapsed_seconds', 0):.3f}s", file=sys.stderr, flush=True)
         with storage.conn() as db:
             db.execute("DELETE FROM market_labels")
             db.execute("DELETE FROM episode_market_context")
@@ -86,19 +94,22 @@ async def benchmark(count: int):
             storage.fetchall("SELECT * FROM episodes WHERE episode_id IN (SELECT episode_id FROM run_episodes WHERE run_id=?)", (run_id,)),
             DEFAULT_HORIZONS, concurrency=8,
         )
+        print(f"market warm: {warm.get('elapsed_seconds', 0):.3f}s", file=sys.stderr, flush=True)
 
         analyzer = IncrementalAnalyzer(web)
         started = time.perf_counter()
         analysis_calls = 0
         while True:
-            result = analyzer.refresh(run_id, batch_size=10_000)
+            result = analyzer.refresh(run_id, batch_size=20_000)
             analysis_calls += 1
             if not result["observations"] and not result["primary_observations"]:
                 break
         timings["incremental_analysis_seconds"] = time.perf_counter() - started
+        progress("incremental analysis", started)
         started = time.perf_counter()
         analyzer.refresh_expensive(run_id, dirty_only=False)
         timings["final_statistics_seconds"] = time.perf_counter() - started
+        progress("final statistics", started)
         observations = web.row("SELECT COUNT(*) n FROM primary_analysis_observations WHERE run_id=?", (run_id,))["n"]
         result = {
             "events": count, "episodes": len(episodes), "classified": classified, "usable_observations": observations,

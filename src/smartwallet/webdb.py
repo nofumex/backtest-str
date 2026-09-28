@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS analysis_observations (
     PRIMARY KEY(run_id, observation_key)
 );
 CREATE INDEX IF NOT EXISTS idx_obs_group ON analysis_observations(run_id, entity_id, pattern, intent_label, asset_key, horizon_seconds, episode_ts);
+CREATE INDEX IF NOT EXISTS idx_obs_episode_horizon ON analysis_observations(
+    run_id, episode_id, asset_key, horizon_seconds
+);
 
 CREATE TABLE IF NOT EXISTS pattern_aggregates (
     run_id TEXT NOT NULL,
@@ -177,6 +180,9 @@ CREATE TABLE IF NOT EXISTS primary_analysis_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_primary_obs_group ON primary_analysis_observations(
     run_id, entity_id, pattern, asset_key, horizon_seconds, episode_ts
+);
+CREATE INDEX IF NOT EXISTS idx_primary_obs_episode_horizon ON primary_analysis_observations(
+    run_id, episode_id, asset_key, horizon_seconds
 );
 
 CREATE TABLE IF NOT EXISTS primary_pattern_aggregates (
@@ -329,6 +335,7 @@ class WebDB:
         with self.connect() as db:
             db.execute("UPDATE run_wallets SET status='failed',error='Interrupted wallet retry budget exhausted',finished_at=datetime('now') WHERE status='running' AND attempts>=3")
             db.execute("UPDATE run_wallets SET status='pending',started_at=NULL WHERE status='running'")
+            db.execute("UPDATE deferred_jobs SET state='pending',next_retry=0,updated_at=? WHERE state='running'", (now_iso(),))
             db.execute(
                 """UPDATE analysis_runs SET status='paused',desired_status='paused',stage='interrupted',
                    current_work='Process restarted — ready to resume',updated_at=?

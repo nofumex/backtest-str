@@ -2,6 +2,7 @@
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS run_events(run_id TEXT NOT NULL,event_id TEXT NOT NULL,built INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(run_id,event_id));
+CREATE INDEX IF NOT EXISTS idx_run_events_built ON run_events(run_id,built,event_id);
 CREATE TABLE IF NOT EXISTS run_episodes(run_id TEXT NOT NULL,episode_id TEXT NOT NULL,PRIMARY KEY(run_id,episode_id));
 CREATE TABLE IF NOT EXISTS market_horizons(episode_id TEXT NOT NULL,horizon_seconds INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending',reason TEXT,attempts INTEGER NOT NULL DEFAULT 0,next_retry REAL NOT NULL DEFAULT 0,PRIMARY KEY(episode_id,horizon_seconds));
 CREATE TABLE IF NOT EXISTS request_attempts(id INTEGER PRIMARY KEY,run_id TEXT,entity_id TEXT,wallet TEXT,provider TEXT,endpoint TEXT,attempt INTEGER,state TEXT,error TEXT,next_retry REAL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS wallet_history_coverage(entity_id TEXT NOT NULL,addre
 CREATE TABLE IF NOT EXISTS deferred_jobs(run_id TEXT NOT NULL,kind TEXT NOT NULL,item_key TEXT NOT NULL,entity_id TEXT,payload_json TEXT NOT NULL DEFAULT '{}',state TEXT NOT NULL DEFAULT 'pending',priority INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_retry REAL NOT NULL DEFAULT 0,error TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(run_id,kind,item_key));
 CREATE INDEX IF NOT EXISTS idx_deferred_jobs_queue ON deferred_jobs(run_id,kind,state,next_retry,priority);
 CREATE TABLE IF NOT EXISTS artifact_provenance(artifact_type TEXT NOT NULL,artifact_id TEXT NOT NULL,version TEXT NOT NULL,input_hash TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(artifact_type,artifact_id));
+CREATE TABLE IF NOT EXISTS analysis_invalidations(run_id TEXT NOT NULL,layer TEXT NOT NULL,pattern_key TEXT NOT NULL,PRIMARY KEY(run_id,layer,pattern_key));
 INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);
 """
 
@@ -58,3 +60,10 @@ def migrate(db):
         if "expires_at" not in columns:
             db.execute("ALTER TABLE market_time_series ADD COLUMN expires_at REAL NOT NULL DEFAULT 0")
         db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(5)")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='analysis_observations'").fetchone():
+        db.execute("CREATE INDEX IF NOT EXISTS idx_obs_episode_horizon ON analysis_observations(run_id,episode_id,asset_key,horizon_seconds)")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='primary_analysis_observations'").fetchone():
+        db.execute("CREATE INDEX IF NOT EXISTS idx_primary_obs_episode_horizon ON primary_analysis_observations(run_id,episode_id,asset_key,horizon_seconds)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_run_events_built ON run_events(run_id,built,event_id)")
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(6)")
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(7)")
